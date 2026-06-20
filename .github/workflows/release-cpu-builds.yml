@@ -34,25 +34,31 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install dependencies
+      - name: Build HAProxy static binary with musl
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            libssl-dev \
-            zlib1g-dev \
-            libpcre2-dev
+          docker run --rm \
+            -v "$PWD:/src" \
+            -w /src \
+            alpine:3.20 \
+            sh -euxc '
+              apk add --no-cache \
+                build-base \
+                ca-certificates \
+                linux-headers \
+                openssl-dev \
+                openssl-libs-static \
+                pcre2-dev \
+                pcre2-static \
+                zlib-dev \
+                zlib-static
 
-      - name: Build HAProxy
-        run: |
-          make clean
-          make -j"$(nproc)" TARGET=linux-glibc \
-            USE_OPENSSL=1 USE_ZLIB=1 USE_STATIC_PCRE2=1 USE_PCRE2_JIT=1 USE_THREAD=1 \
-            OPT_CFLAGS="-O3 -flto" \
-            CPU_CFLAGS="-march=${{ matrix.march }} -mtune=generic" \
-            LDFLAGS="-static -flto" \
-            ADDLIB="-ldl"
+              make clean
+              make -j"$(nproc)" TARGET=linux-musl \
+                USE_OPENSSL=1 USE_ZLIB=1 USE_STATIC_PCRE2=1 USE_PCRE2_JIT=1 USE_THREAD=1 \
+                OPT_CFLAGS="-O3 -flto=auto" \
+                CPU_CFLAGS="-march=${{ matrix.march }} -mtune=generic" \
+                LDFLAGS="-static -flto=auto"
+            '
 
       - name: Verify static binary
         run: |
@@ -75,8 +81,8 @@ jobs:
           cat > "dist/${out}/README.txt" <<EOF
           HAProxy Linux x86-64 fully static build
           CPU level: ${{ matrix.cpu_level }}
-          Compiler flags: -march=${{ matrix.march }} -mtune=generic -O3 -flto -static
-          Link mode: fully static
+          Compiler flags: -march=${{ matrix.march }} -mtune=generic -O3 -flto=auto -static
+          Link mode: fully static musl
 
           x86-64-v1: baseline x86-64
           x86-64-v2: SSE3/SSSE3/SSE4.x/POPCNT/CX16/LAHF-SAHF
