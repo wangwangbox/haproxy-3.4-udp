@@ -51,10 +51,12 @@ jobs:
                 zlib-dev \
                 zlib-static
 
-              test -f /usr/lib/libpcre2-8.a
-              test -f /usr/lib/libssl.a
-              test -f /usr/lib/libcrypto.a
-              test -f /usr/lib/libz.a
+              for lib in libpcre2-8.a libssl.a libcrypto.a libz.a; do
+                path="$(gcc -print-file-name="$lib")"
+                test "$path" != "$lib"
+                test -f "$path"
+                echo "$lib -> $path"
+              done
 
               make clean
               make -j"$(nproc)" TARGET=linux-musl \
