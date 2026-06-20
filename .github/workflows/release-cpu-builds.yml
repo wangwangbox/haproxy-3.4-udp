@@ -61,6 +61,7 @@ jobs:
               make clean
               make -j"$(nproc)" TARGET=linux-musl \
                 USE_OPENSSL=1 USE_ZLIB=1 USE_STATIC_PCRE2=1 USE_PCRE2_JIT=1 USE_THREAD=1 \
+                USE_DL= USE_RT= USE_LIBCRYPT= \
                 OPT_CFLAGS="-O3 -flto=auto" \
                 CPU_CFLAGS="-march=${{ matrix.march }} -mtune=generic" \
                 LDFLAGS="-static -flto=auto"
@@ -71,6 +72,11 @@ jobs:
           set -eu
           file haproxy
           if ldd haproxy 2>&1 | grep -q "not a dynamic executable"; then
+            if readelf -l haproxy | grep -q "Requesting program interpreter"; then
+              echo "haproxy still has a dynamic interpreter"
+              readelf -l haproxy
+              exit 1
+            fi
             exit 0
           fi
           echo "haproxy is not fully static"
