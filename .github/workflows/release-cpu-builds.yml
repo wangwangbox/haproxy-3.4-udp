@@ -1,0 +1,118 @@
+name: Release CPU builds
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing Git tag to publish, for example v3.4-udp1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.cpu_level }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cpu_level: x86-64-v1
+            march: x86-64
+          - cpu_level: x86-64-v2
+            march: x86-64-v2
+          - cpu_level: x86-64-v3
+            march: x86-64-v3
+          - cpu_level: x86-64-v4
+            march: x86-64-v4
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            libssl-dev \
+            zlib1g-dev \
+            libpcre2-dev
+
+      - name: Build HAProxy
+        run: |
+          make clean
+          make -j"$(nproc)" TARGET=linux-glibc \
+            USE_OPENSSL=1 USE_ZLIB=1 USE_PCRE2=1 USE_PCRE2_JIT=1 USE_THREAD=1 \
+            OPT_CFLAGS="-O3 -flto" \
+            CPU_CFLAGS="-march=${{ matrix.march }} -mtune=generic" \
+            LDFLAGS="-flto"
+
+      - name: Package
+        run: |
+          set -eu
+          out="haproxy-linux-${{ matrix.cpu_level }}"
+          mkdir -p "dist/${out}"
+          cp haproxy "dist/${out}/haproxy"
+          strip "dist/${out}/haproxy"
+          cat > "dist/${out}/README.txt" <<EOF
+          HAProxy Linux x86-64 build
+          CPU level: ${{ matrix.cpu_level }}
+          Compiler flags: -march=${{ matrix.march }} -mtune=generic -O3 -flto
+
+          x86-64-v1: baseline x86-64
+          x86-64-v2: SSE3/SSSE3/SSE4.x/POPCNT/CX16/LAHF-SAHF
+          x86-64-v3: AVX/AVX2/BMI/F16C/FMA/MOVBE/XSAVE/LZCNT-or-ABM
+          x86-64-v4: AVX-512F/BW/CD/DQ/VL
+          EOF
+          tar -C dist -czf "dist/${out}.tar.gz" "${out}"
+          sha256sum "dist/${out}.tar.gz" > "dist/${out}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: haproxy-linux-${{ matrix.cpu_level }}
+          path: |
+            dist/haproxy-linux-${{ matrix.cpu_level }}.tar.gz
+            dist/haproxy-linux-${{ matrix.cpu_level }}.tar.gz.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.release_tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --title "$TAG" \
+              --notes "Linux x86-64 HAProxy builds for x86-64-v1/v2/v3/v4."
+          fi
