@@ -48,22 +48,35 @@ jobs:
         run: |
           make clean
           make -j"$(nproc)" TARGET=linux-glibc \
-            USE_OPENSSL=1 USE_ZLIB=1 USE_PCRE2=1 USE_PCRE2_JIT=1 USE_THREAD=1 \
+            USE_OPENSSL=1 USE_ZLIB=1 USE_STATIC_PCRE2=1 USE_PCRE2_JIT=1 USE_THREAD=1 \
             OPT_CFLAGS="-O3 -flto" \
             CPU_CFLAGS="-march=${{ matrix.march }} -mtune=generic" \
-            LDFLAGS="-flto"
+            LDFLAGS="-static -flto" \
+            ADDLIB="-ldl"
+
+      - name: Verify static binary
+        run: |
+          set -eu
+          file haproxy
+          if ldd haproxy 2>&1 | grep -q "not a dynamic executable"; then
+            exit 0
+          fi
+          echo "haproxy is not fully static"
+          ldd haproxy || true
+          exit 1
 
       - name: Package
         run: |
           set -eu
-          out="haproxy-linux-${{ matrix.cpu_level }}"
+          out="haproxy-linux-static-${{ matrix.cpu_level }}"
           mkdir -p "dist/${out}"
           cp haproxy "dist/${out}/haproxy"
           strip "dist/${out}/haproxy"
           cat > "dist/${out}/README.txt" <<EOF
-          HAProxy Linux x86-64 build
+          HAProxy Linux x86-64 fully static build
           CPU level: ${{ matrix.cpu_level }}
-          Compiler flags: -march=${{ matrix.march }} -mtune=generic -O3 -flto
+          Compiler flags: -march=${{ matrix.march }} -mtune=generic -O3 -flto -static
+          Link mode: fully static
 
           x86-64-v1: baseline x86-64
           x86-64-v2: SSE3/SSSE3/SSE4.x/POPCNT/CX16/LAHF-SAHF
@@ -76,10 +89,10 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: haproxy-linux-${{ matrix.cpu_level }}
+          name: haproxy-linux-static-${{ matrix.cpu_level }}
           path: |
-            dist/haproxy-linux-${{ matrix.cpu_level }}.tar.gz
-            dist/haproxy-linux-${{ matrix.cpu_level }}.tar.gz.sha256
+            dist/haproxy-linux-static-${{ matrix.cpu_level }}.tar.gz
+            dist/haproxy-linux-static-${{ matrix.cpu_level }}.tar.gz.sha256
 
   release:
     name: Publish GitHub Release
@@ -118,5 +131,5 @@ jobs:
             gh release create "$TAG" dist/* \
               --verify-tag \
               --title "$TAG" \
-              --notes "Linux x86-64 HAProxy builds for x86-64-v1/v2/v3/v4."
+              --notes "Fully static Linux x86-64 HAProxy builds for x86-64-v1/v2/v3/v4."
           fi
