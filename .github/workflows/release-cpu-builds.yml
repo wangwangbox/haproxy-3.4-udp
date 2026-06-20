@@ -48,9 +48,13 @@ jobs:
                 openssl-dev \
                 openssl-libs-static \
                 pcre2-dev \
-                pcre2-static \
                 zlib-dev \
                 zlib-static
+
+              test -f /usr/lib/libpcre2-8.a
+              test -f /usr/lib/libssl.a
+              test -f /usr/lib/libcrypto.a
+              test -f /usr/lib/libz.a
 
               make clean
               make -j"$(nproc)" TARGET=linux-musl \
