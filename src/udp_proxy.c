@@ -48,10 +48,24 @@ struct udp_proxy_shard {
 };
 
 static struct udp_proxy_shard udp_proxy_shards[MAX_THREADS];
+static int udp_proxy_nb_sessions;
 
 static int udp_proxy_sendto(int fd, const void *buf, size_t len,
                             const struct sockaddr_storage *addr);
 static void udp_proxy_delete_session(struct udp_proxy_session *sess);
+static int udp_proxy_send_connected(struct udp_proxy_session *sess,
+                                    const void *buf, size_t len);
+
+static int udp_proxy_session_limit(const struct listener *l)
+{
+	const struct proxy *px = l->bind_conf->frontend;
+
+	if (l->bind_conf->maxconn > 0)
+		return l->bind_conf->maxconn;
+	if (px->maxconn > 0)
+		return px->maxconn;
+	return global.maxconn;
+}
 
 static void udp_proxy_shard_init(struct udp_proxy_shard *shard)
 {
@@ -212,6 +226,10 @@ static int udp_proxy_connect_session(struct udp_proxy_session *sess)
 	fd = socket(sess->srv->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
 	if (fd == -1)
 		return 0;
+	if (fd >= global.maxsock) {
+		close(fd);
+		return 0;
+	}
 
 	if (global.tune.backend_rcvbuf)
 		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &global.tune.backend_rcvbuf,
@@ -243,8 +261,9 @@ static void udp_proxy_delete_session(struct udp_proxy_session *sess)
 	LIST_DEL_INIT(&sess->by_hash);
 	if (sess->fd >= 0) {
 		fd_delete(sess->fd);
-		close(sess->fd);
+		sess->fd = -1;
 	}
+	_HA_ATOMIC_DEC(&udp_proxy_nb_sessions);
 	free(sess);
 }
 
@@ -263,6 +282,11 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 	udp_proxy_prune_bucket(shard, hash & UDP_PROXY_HASH_MASK);
 	sess = udp_proxy_find_client(shard, l, client, hash);
 	if (!sess) {
+		int limit = udp_proxy_session_limit(l);
+
+		if (limit > 0 && _HA_ATOMIC_LOAD(&udp_proxy_nb_sessions) >= limit)
+			return NULL;
+
 		sess = calloc(1, sizeof(*sess));
 		if (sess) {
 			LIST_INIT(&sess->by_hash);
@@ -275,9 +299,11 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 				free(sess);
 				sess = NULL;
 			}
-			else
+			else {
+				_HA_ATOMIC_INC(&udp_proxy_nb_sessions);
 				LIST_APPEND(&shard->buckets[hash & UDP_PROXY_HASH_MASK],
 				            &sess->by_hash);
+			}
 		}
 	}
 	if (sess) {
@@ -296,6 +322,25 @@ static int udp_proxy_sendto(int fd, const void *buf, size_t len,
 	ret = sendto(fd, buf, len, 0, (const struct sockaddr *)addr,
 	             get_addr_len(addr));
 	return ret == (ssize_t)len;
+}
+
+static int udp_proxy_send_connected(struct udp_proxy_session *sess,
+                                    const void *buf, size_t len)
+{
+	ssize_t ret;
+
+	do {
+		ret = send(sess->fd, buf, len, 0);
+	} while (ret < 0 && errno == EINTR);
+
+	if (ret == (ssize_t)len)
+		return 1;
+
+	if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		return 0;
+
+	udp_proxy_delete_session(sess);
+	return -1;
 }
 
 void udp_proxy_fd_handler(int fd)
@@ -337,8 +382,6 @@ void udp_proxy_fd_handler(int fd)
 		sess = udp_proxy_get_session(l, &saddr, srv);
 		if (!sess)
 			continue;
-		if (send(sess->fd, buf->area, ret, 0) < 0) {
-			udp_proxy_delete_session(sess);
-		}
+		udp_proxy_send_connected(sess, buf->area, ret);
 	} while (--max_accept);
 }
