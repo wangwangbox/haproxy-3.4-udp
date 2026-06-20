@@ -60,7 +60,7 @@ jobs:
 
               make clean
               make -j"$(nproc)" TARGET=linux-musl \
-                USE_OPENSSL=1 USE_ZLIB=1 USE_STATIC_PCRE2=1 USE_PCRE2_JIT=1 USE_THREAD=1 \
+                USE_OPENSSL=1 USE_ZLIB=1 USE_PCRE2=1 USE_PCRE2_JIT=1 USE_THREAD=1 \
                 USE_DL= USE_RT= USE_LIBCRYPT= \
                 OPT_CFLAGS="-O3 -flto=auto" \
                 CPU_CFLAGS="-march=${{ matrix.march }} -mtune=generic" \
@@ -95,6 +95,7 @@ jobs:
           CPU level: ${{ matrix.cpu_level }}
           Compiler flags: -march=${{ matrix.march }} -mtune=generic -O3 -flto=auto -static
           Link mode: fully static musl
+          PCRE2: linked statically by the global -static linker mode
 
           x86-64-v1: baseline x86-64
           x86-64-v2: SSE3/SSSE3/SSE4.x/POPCNT/CX16/LAHF-SAHF
