@@ -519,6 +519,8 @@ const char *proxy_mode_str(int mode) {
 		return "peers";
 	else if (mode == PR_MODE_SPOP)
 		return "spop";
+	else if (mode == PR_MODE_UDP)
+		return "udp";
 	else
 		return "unknown";
 }
@@ -534,6 +536,8 @@ enum pr_mode str_to_proxy_mode(const char *mode)
 		return PR_MODE_SYSLOG;
 	else if (strcmp(mode, "spop") == 0)
 		return PR_MODE_SPOP;
+	else if (strcmp(mode, "udp") == 0)
+		return PR_MODE_UDP;
 
 	return PR_MODES;
 }
@@ -1852,6 +1856,11 @@ int proxy_finalize(struct proxy *px, int *err_code)
 	case PR_MODE_SYSLOG:
 		/* this mode is initialized as the classic tcp proxy */
 		cfgerr += proxy_cfg_ensure_no_http(px);
+		break;
+
+	case PR_MODE_UDP:
+		cfgerr += proxy_cfg_ensure_no_http(px);
+		cfgerr += proxy_cfg_ensure_no_log(px);
 		break;
 
 	case PR_MODE_SPOP:
@@ -3647,7 +3656,7 @@ void proxy_cond_disable(struct proxy *p)
 			cum_sess = COUNTERS_SHARED_TOTAL(p->be_counters.shared.tg, cum_sess, HA_ATOMIC_LOAD);
 	}
 
-	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG || p->mode == PR_MODE_SPOP) && !(p->cap & PR_CAP_INT))
+	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG || p->mode == PR_MODE_SPOP || p->mode == PR_MODE_UDP) && !(p->cap & PR_CAP_INT))
 		ha_warning("Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
 			   p->id, cum_conn, cum_sess);
 

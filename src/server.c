@@ -3533,7 +3533,7 @@ static int _srv_check_proxy_mode(struct server *srv, char postparse)
 		goto out;
 	}
 
-	if (srv->proxy->mode == PR_MODE_SYSLOG) {
+	if (srv->proxy->mode == PR_MODE_SYSLOG || srv->proxy->mode == PR_MODE_UDP) {
 		/* log backend server (belongs to proxy with mode log enabled):
 		 * perform some compatibility checks
 		 */
@@ -3545,14 +3545,21 @@ static int _srv_check_proxy_mode(struct server *srv, char postparse)
 		 */
 		if (srv->addr.ss_family != AF_UNSPEC &&
 		    srv->addr.ss_family != AF_INET && srv->addr.ss_family != AF_INET6) {
-			ha_alert("log server address family not supported for log backend server.\n");
+			ha_alert("%s server address family not supported.\n", proxy_mode_str(srv->proxy->mode));
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
 		/* only @tcp or @udp address forms (or equivalent) are supported */
-		if (!(srv->addr_type.xprt_type == PROTO_TYPE_DGRAM && srv->addr_type.proto_type == PROTO_TYPE_DGRAM) &&
+		if (srv->proxy->mode == PR_MODE_UDP &&
+		    !(srv->addr_type.xprt_type == PROTO_TYPE_DGRAM && srv->addr_type.proto_type == PROTO_TYPE_DGRAM) &&
 		    !(srv->addr_type.xprt_type == PROTO_TYPE_STREAM && srv->addr_type.proto_type == PROTO_TYPE_STREAM)) {
+			ha_alert("udp server address type not supported.\n");
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+		else if (srv->proxy->mode == PR_MODE_SYSLOG &&
+		         !(srv->addr_type.xprt_type == PROTO_TYPE_DGRAM && srv->addr_type.proto_type == PROTO_TYPE_DGRAM) &&
+		         !(srv->addr_type.xprt_type == PROTO_TYPE_STREAM && srv->addr_type.proto_type == PROTO_TYPE_STREAM)) {
 			ha_alert("log server address type not supported for log backend server.\n");
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}

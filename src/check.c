@@ -66,6 +66,30 @@
 #include <haproxy/trace.h>
 #include <haproxy/vars.h>
 
+static int udp_check_connect(struct check *check)
+{
+	struct server *srv = check->server;
+	struct sockaddr_storage addr;
+	int fd;
+
+	if (!srv || srv->addr.ss_family == AF_UNSPEC)
+		return 0;
+
+	fd = socket(srv->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+	if (fd == -1)
+		return 0;
+
+	addr = srv->addr;
+	set_host_port(&addr, srv->svc_port);
+	if (connect(fd, (struct sockaddr *)&addr, get_addr_len(&addr)) == -1) {
+		close(fd);
+		return 0;
+	}
+
+	close(fd);
+	return 1;
+}
+
 /* trace source and events */
 static void check_trace(enum trace_level level, uint64_t mask,
 			const struct trace_source *src,
@@ -1312,6 +1336,14 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		TRACE_STATE("init new health-check", CHK_EV_TASK_WAKE|CHK_EV_HCHK_START, check);
 
 		check->current_step = NULL;
+
+		if (proxy->mode == PR_MODE_UDP) {
+			if (udp_check_connect(check))
+				set_server_check_status(check, HCHK_STATUS_L4OK, NULL);
+			else
+				set_server_check_status(check, HCHK_STATUS_L4CON, NULL);
+			goto end;
+		}
 
 		check->sc = sc_new_from_check(check);
 		if (!check->sc) {

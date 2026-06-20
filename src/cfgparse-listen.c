@@ -34,6 +34,7 @@
 #include <haproxy/stick_table.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/tools.h>
+#include <haproxy/udp_proxy.h>
 #include <haproxy/uri_auth.h>
 
 /* some keywords that are still being parsed using strcmp() and are not
@@ -66,6 +67,59 @@ static const char *common_options[] = {
 	"external-check", "forwardfor", "original-to", "forwarded",
 	NULL /* must be last */
 };
+
+static int cfg_convert_bind_to_udp(struct proxy *px, const char *file, int linenum)
+{
+	struct bind_conf *bind_conf;
+	char *errmsg = NULL;
+
+	list_for_each_entry(bind_conf, &px->conf.bind, by_fe) {
+		struct listener *l, *back;
+
+		if (bind_conf->options & BC_O_USE_SOCK_DGRAM)
+			continue;
+
+		list_for_each_entry_safe(l, back, &bind_conf->listeners, by_bind) {
+			delete_listener(l);
+			LIST_DEL_INIT(&l->by_bind);
+			LIST_DEL_INIT(&l->by_fe);
+			free(l);
+			global.maxsock--;
+		}
+
+		bind_conf->options &= ~BC_O_USE_SOCK_STREAM;
+		if (bind_conf->maxseg) {
+			ha_warning("parsing [%s:%d] : ignoring TCP-only mss setting on UDP bind '%s'.\n",
+			           file, linenum, bind_conf->arg);
+			bind_conf->maxseg = 0;
+		}
+		if (bind_conf->tcp_ut) {
+			ha_warning("parsing [%s:%d] : ignoring TCP-only tcp-ut setting on UDP bind '%s'.\n",
+			           file, linenum, bind_conf->arg);
+			bind_conf->tcp_ut = 0;
+		}
+		ha_free(&bind_conf->tcp_md5sig);
+		if (!str2receiver(bind_conf->arg, px, bind_conf, bind_conf->file, bind_conf->line, &errmsg)) {
+			if (errmsg) {
+				indent_msg(&errmsg, 2);
+				ha_alert("parsing [%s:%d] : cannot convert bind '%s' to udp: %s\n",
+				         file, linenum, bind_conf->arg, errmsg);
+				ha_free(&errmsg);
+			}
+			else
+				ha_alert("parsing [%s:%d] : cannot convert bind '%s' to udp.\n",
+				         file, linenum, bind_conf->arg);
+			return ERR_ALERT | ERR_FATAL;
+		}
+
+		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			l->rx.iocb = udp_proxy_fd_handler;
+			global.maxsock++;
+		}
+	}
+
+	return ERR_NONE;
+}
 
 /* Report a warning if a rule is placed after a 'tcp-request connection' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
@@ -585,7 +639,20 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		 * are comma-separated IPs or port ranges. So all further processing
 		 * will have to be applied to all listeners created after last_listen.
 		 */
-		if (!str2listener(args[1], curproxy, bind_conf, file, linenum, &errmsg)) {
+		if (curproxy->mode == PR_MODE_UDP) {
+			if (!str2receiver(args[1], curproxy, bind_conf, file, linenum, &errmsg)) {
+				if (errmsg) {
+					indent_msg(&errmsg, 2);
+					ha_alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], errmsg);
+				}
+				else
+					ha_alert("parsing [%s:%d] : '%s' : error encountered while parsing listening address '%s'.\n",
+						 file, linenum, args[0], args[1]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
+		else if (!str2listener(args[1], curproxy, bind_conf, file, linenum, &errmsg)) {
 			if (errmsg) {
 				indent_msg(&errmsg, 2);
 				ha_alert("parsing [%s:%d] : '%s' : %s\n", file, linenum, args[0], errmsg);
@@ -598,6 +665,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			if (curproxy->mode == PR_MODE_UDP)
+				l->rx.iocb = udp_proxy_fd_handler;
 			/* Set default global rights and owner for unix bind  */
 			global.maxsock++;
 		}
@@ -677,6 +746,11 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		curproxy->mode = mode;
+		if (mode == PR_MODE_UDP && !(curproxy->cap & PR_CAP_DEF)) {
+			err_code |= cfg_convert_bind_to_udp(curproxy, file, linenum);
+			if (err_code & ERR_FATAL)
+				goto out;
+		}
 		if (curproxy->cap & PR_CAP_DEF)
 			curproxy->flags |= PR_FL_DEF_EXPLICIT_MODE;
 	}

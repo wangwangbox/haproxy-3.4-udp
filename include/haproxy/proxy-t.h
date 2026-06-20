@@ -57,6 +57,7 @@ enum pr_mode {
 	PR_MODE_SYSLOG = 0x08,
 	PR_MODE_PEERS  = 0x10,
 	PR_MODE_SPOP   = 0x20,
+	PR_MODE_UDP    = 0x40,
 } __attribute__((packed));
 
 enum PR_SRV_STATE_FILE {

@@ -946,7 +946,8 @@ OBJS += src/mux_h2.o src/mux_h1.o src/mux_fcgi.o src/log.o		\
         src/raw_sock.o src/action.o src/stats-file.o src/buf.o		\
         src/xprt_handshake.o src/proto_uxst.o src/lb_fwrr.o		\
         src/uri_normalizer.o src/mailers.o src/protocol.o		\
-        src/cfgcond.o src/proto_udp.o src/lb_fwlc.o src/ebmbtree.o	\
+        src/cfgcond.o src/proto_udp.o src/udp_proxy.o src/lb_fwlc.o	\
+        src/ebmbtree.o							\
         src/proto_uxdg.o src/cfgdiag.o src/sock_unix.o src/sha1.o	\
         src/lb_fas.o src/clock.o src/sock_inet.o src/ev_select.o	\
         src/lb_map.o src/shctx.o src/hpack-dec.o src/net_helper.o       \
