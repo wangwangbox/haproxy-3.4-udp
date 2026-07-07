@@ -1905,6 +1905,15 @@ int init_srv_check(struct server *srv)
 			srv->check.xprt = xprt_get(XPRT_SSL);
 	}
 
+	if (srv->proxy->mode == PR_MODE_UDP &&
+	    (srv->check.type ? srv->check.type : (srv->proxy->options2 & PR_O2_CHK_ANY)) == PR_O2_TCPCHK_CHK) {
+		srv->check.addr_type.proto_type = PROTO_TYPE_STREAM;
+		srv->check.addr_type.xprt_type = PROTO_TYPE_STREAM;
+		srv->check.alt_proto = 0;
+		if (srv->check.use_ssl == 1)
+			srv->check.xprt = xprt_get(XPRT_SSL);
+	}
+
 	/* Inherit the mux protocol from the server if not already defined for
 	 * the check
 	 */
