@@ -1342,9 +1342,10 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 				set_server_check_status(check, HCHK_STATUS_L4CON, NULL);
 				goto end;
 			}
-			set_server_check_status(check, HCHK_STATUS_L4OK, NULL);
-			if (check->type != PR_O2_TCPCHK_CHK)
+			if (check->type != PR_O2_TCPCHK_CHK) {
+				set_server_check_status(check, HCHK_STATUS_L4OK, NULL);
 				goto end;
+			}
 		}
 
 		check->sc = sc_new_from_check(check);
@@ -1912,6 +1913,8 @@ int init_srv_check(struct server *srv)
 		srv->check.alt_proto = 0;
 		if (srv->check.use_ssl == 1)
 			srv->check.xprt = xprt_get(XPRT_SSL);
+		else
+			srv->check.xprt = xprt_get(XPRT_RAW);
 	}
 
 	/* Inherit the mux protocol from the server if not already defined for
