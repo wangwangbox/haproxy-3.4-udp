@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Health-checks functions.
  *
  * Copyright 2000-2009 Willy Tarreau <w@1wt.eu>
@@ -1338,11 +1338,13 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		check->current_step = NULL;
 
 		if (proxy->mode == PR_MODE_UDP) {
-			if (udp_check_connect(check))
-				set_server_check_status(check, HCHK_STATUS_L4OK, NULL);
-			else
+			if (!udp_check_connect(check)) {
 				set_server_check_status(check, HCHK_STATUS_L4CON, NULL);
-			goto end;
+				goto end;
+			}
+			set_server_check_status(check, HCHK_STATUS_L4OK, NULL);
+			if (check->type != PR_O2_TCPCHK_CHK)
+				goto end;
 		}
 
 		check->sc = sc_new_from_check(check);

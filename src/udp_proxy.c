@@ -11,6 +11,9 @@
 #include <unistd.h>
 
 #include <haproxy/api.h>
+#include <haproxy/acl.h>
+#include <haproxy/action.h>
+#include <haproxy/backend.h>
 #include <haproxy/backend-t.h>
 #include <haproxy/buf-t.h>
 #include <haproxy/chunk.h>
@@ -20,10 +23,16 @@
 #include <haproxy/listener.h>
 #include <haproxy/obj_type.h>
 #include <haproxy/proxy.h>
+#include <haproxy/resolvers.h>
+#include <haproxy/sample-t.h>
 #include <haproxy/server-t.h>
+#include <haproxy/session-t.h>
+#include <haproxy/stream-t.h>
 #include <haproxy/thread.h>
 #include <haproxy/time.h>
+#include <haproxy/ticks.h>
 #include <haproxy/tools.h>
+#include <haproxy/vars.h>
 
 #define UDP_PROXY_SESS_TIMEOUT_MS 60000
 #define UDP_PROXY_HASH_BITS 12
@@ -55,6 +64,73 @@ static int udp_proxy_sendto(int fd, const void *buf, size_t len,
 static void udp_proxy_delete_session(struct udp_proxy_session *sess);
 static int udp_proxy_send_connected(struct udp_proxy_session *sess,
                                     const void *buf, size_t len);
+
+static void udp_proxy_eval_resolve_rules(struct proxy *px, struct session *sess,
+                                         struct stream *strm)
+{
+	struct act_rule *rule;
+
+	list_for_each_entry(rule, &px->tcp_req.inspect_rules, list) {
+		if (rule->check_ptr != check_action_do_resolve)
+			continue;
+		if (rule->cond &&
+		    !acl_match_cond(rule->cond, px, sess, strm,
+		                    SMP_OPT_DIR_REQ | SMP_OPT_FINAL))
+			continue;
+
+		EXEC_CTX_WITH_RET(rule->exec_ctx,
+		                  rule->action_ptr(rule, px, sess, strm,
+		                                   ACT_OPT_FINAL | ACT_OPT_FINAL_EARLY | ACT_OPT_FIRST));
+	}
+}
+
+static struct proxy *udp_proxy_eval_switching_rules(struct proxy *px,
+                                                    const struct sockaddr_storage *client)
+{
+	struct switching_rule *rule;
+	struct sockaddr_storage src;
+	struct session sess;
+	struct stream strm;
+	struct proxy *backend = NULL;
+
+	if (LIST_ISEMPTY(&px->tcp_req.inspect_rules) && LIST_ISEMPTY(&px->switching_rules))
+		return px;
+
+	memset(&sess, 0, sizeof(sess));
+	memset(&strm, 0, sizeof(strm));
+	src = *client;
+
+	sess.fe = px;
+	sess.src = &src;
+	vars_init_head(&sess.vars, SCOPE_SESS);
+
+	strm.sess = &sess;
+	strm.be = px;
+	strm.rules_exp = TICK_ETERNITY;
+	vars_init_head(&strm.vars_txn, SCOPE_TXN);
+	vars_init_head(&strm.vars_reqres, SCOPE_REQ);
+
+	udp_proxy_eval_resolve_rules(px, &sess, &strm);
+
+	list_for_each_entry(rule, &px->switching_rules, list) {
+		if (rule->cond &&
+		    !acl_match_cond(rule->cond, px, &sess, &strm,
+		                    SMP_OPT_DIR_REQ | SMP_OPT_FINAL))
+			continue;
+		if (rule->dynamic)
+			continue;
+		if (rule->be.backend && be_is_eligible(rule->be.backend)) {
+			backend = rule->be.backend;
+			break;
+		}
+	}
+
+	vars_prune(&strm.vars_reqres, &sess, &strm);
+	vars_prune(&strm.vars_txn, &sess, &strm);
+	vars_prune_per_sess(&sess.vars);
+
+	return backend ? backend : px;
+}
 
 static int udp_proxy_session_limit(const struct listener *l)
 {
@@ -281,6 +357,10 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 	hash = udp_proxy_hash_key(l, client);
 	udp_proxy_prune_bucket(shard, hash & UDP_PROXY_HASH_MASK);
 	sess = udp_proxy_find_client(shard, l, client, hash);
+	if (sess && sess->srv != srv) {
+		udp_proxy_delete_session(sess);
+		sess = NULL;
+	}
 	if (!sess) {
 		int limit = udp_proxy_session_limit(l);
 
@@ -376,7 +456,7 @@ void udp_proxy_fd_handler(int fd)
 			break;
 		}
 
-		srv = udp_proxy_pick_server(px);
+		srv = udp_proxy_pick_server(udp_proxy_eval_switching_rules(px, &saddr));
 		if (!srv)
 			continue;
 		sess = udp_proxy_get_session(l, &saddr, srv);
