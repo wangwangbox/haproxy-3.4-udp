@@ -16,6 +16,7 @@
 #include <haproxy/chunk.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
+#include <haproxy/init.h>
 #include <haproxy/lb_chash.h>
 #include <haproxy/lb_fas.h>
 #include <haproxy/lb_fwlc.h>
@@ -27,11 +28,13 @@
 #include <haproxy/obj_type.h>
 #include <haproxy/proxy.h>
 #include <haproxy/server-t.h>
+#include <haproxy/task.h>
 #include <haproxy/thread.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
 
 #define UDP_PROXY_SESS_TIMEOUT_MS 60000
+#define UDP_PROXY_GC_INTERVAL_MS 1000
 #define UDP_PROXY_HASH_BITS 12
 #define UDP_PROXY_HASH_SIZE (1U << UDP_PROXY_HASH_BITS)
 #define UDP_PROXY_HASH_MASK (UDP_PROXY_HASH_SIZE - 1)
@@ -54,6 +57,7 @@ struct udp_proxy_shard {
 };
 
 static struct udp_proxy_shard udp_proxy_shards[MAX_THREADS];
+static struct task *udp_proxy_gc_tasks[MAX_THREADS];
 static int udp_proxy_nb_sessions;
 
 static int udp_proxy_sendto(int fd, const void *buf, size_t len,
@@ -284,6 +288,25 @@ static void udp_proxy_gc(struct udp_proxy_shard *shard)
 	}
 }
 
+static void udp_proxy_gc_all(struct udp_proxy_shard *shard)
+{
+	unsigned int i;
+
+	for (i = 0; i < UDP_PROXY_HASH_SIZE; i++)
+		udp_proxy_prune_bucket(shard, i);
+}
+
+static struct task *udp_proxy_gc_task(struct task *t, void *context, unsigned int state)
+{
+	struct udp_proxy_shard *shard = context;
+
+	if (_HA_ATOMIC_LOAD(&udp_proxy_nb_sessions) > 0)
+		udp_proxy_gc_all(shard);
+
+	task_schedule(t, tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_GC_INTERVAL_MS)));
+	return t;
+}
+
 static struct udp_proxy_session *udp_proxy_find_client(struct udp_proxy_shard *shard,
                                                        struct listener *l,
                                                        const struct sockaddr_storage *client,
@@ -503,3 +526,22 @@ void udp_proxy_fd_handler(int fd)
 		udp_proxy_send_connected(sess, buf->area, ret);
 	} while (--max_accept);
 }
+
+static int udp_proxy_thread_init(void)
+{
+	udp_proxy_shard_init(&udp_proxy_shards[tid]);
+	udp_proxy_gc_tasks[tid] = task_new_here();
+	if (!udp_proxy_gc_tasks[tid]) {
+		ha_alert("failed to allocate UDP proxy GC task.\n");
+		return 0;
+	}
+
+	udp_proxy_gc_tasks[tid]->process = udp_proxy_gc_task;
+	udp_proxy_gc_tasks[tid]->context = &udp_proxy_shards[tid];
+	task_schedule(udp_proxy_gc_tasks[tid],
+	              tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_GC_INTERVAL_MS)));
+
+	return 1;
+}
+
+REGISTER_PER_THREAD_INIT(udp_proxy_thread_init);
