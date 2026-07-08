@@ -19,6 +19,7 @@
 #include <haproxy/chunk.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
+#include <haproxy/init.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/obj_type.h>
@@ -28,6 +29,7 @@
 #include <haproxy/server-t.h>
 #include <haproxy/session-t.h>
 #include <haproxy/stream-t.h>
+#include <haproxy/task.h>
 #include <haproxy/thread.h>
 #include <haproxy/time.h>
 #include <haproxy/ticks.h>
@@ -35,6 +37,7 @@
 #include <haproxy/vars.h>
 
 #define UDP_PROXY_SESS_TIMEOUT_MS 60000
+#define UDP_PROXY_GC_INTERVAL_MS 1000
 #define UDP_PROXY_HASH_BITS 12
 #define UDP_PROXY_HASH_SIZE (1U << UDP_PROXY_HASH_BITS)
 #define UDP_PROXY_HASH_MASK (UDP_PROXY_HASH_SIZE - 1)
@@ -57,6 +60,7 @@ struct udp_proxy_shard {
 };
 
 static struct udp_proxy_shard udp_proxy_shards[MAX_THREADS];
+static struct task *udp_proxy_gc_tasks[MAX_THREADS];
 static int udp_proxy_nb_sessions;
 
 static int udp_proxy_sendto(int fd, const void *buf, size_t len,
@@ -212,20 +216,27 @@ static int udp_addr_match(const struct sockaddr_storage *a,
 	return ipcmp(a, b, 1) == 0;
 }
 
+static int udp_proxy_srv_usable(const struct server *srv)
+{
+	if (srv->addr.ss_family == AF_UNSPEC)
+		return 0;
+	if (srv->cur_admin & SRV_ADMF_MAINT)
+		return 0;
+	if ((srv->check.state & CHK_ST_CONFIGURED) && srv->cur_state == SRV_ST_STOPPED)
+		return 0;
+	return 1;
+}
+
 static struct server *udp_proxy_pick_server(struct proxy *px)
 {
-	struct server *srv, *fallback = NULL;
+	struct server *srv;
 
 	for (srv = px->srv; srv; srv = srv->next) {
-		if (srv->addr.ss_family == AF_UNSPEC)
-			continue;
-		if (srv->cur_state != SRV_ST_STOPPED)
+		if (udp_proxy_srv_usable(srv))
 			return srv;
-		if (!fallback && !(srv->cur_admin & SRV_ADMF_MAINT))
-			fallback = srv;
 	}
 
-	return fallback;
+	return NULL;
 }
 
 static void udp_proxy_prune_bucket(struct udp_proxy_shard *shard, unsigned int bucket)
@@ -246,6 +257,25 @@ static void udp_proxy_gc(struct udp_proxy_shard *shard)
 		udp_proxy_prune_bucket(shard, shard->gc_bucket);
 		shard->gc_bucket = (shard->gc_bucket + 1) & UDP_PROXY_HASH_MASK;
 	}
+}
+
+static void udp_proxy_gc_all(struct udp_proxy_shard *shard)
+{
+	unsigned int i;
+
+	for (i = 0; i < UDP_PROXY_HASH_SIZE; i++)
+		udp_proxy_prune_bucket(shard, i);
+}
+
+static struct task *udp_proxy_gc_task(struct task *t, void *context, unsigned int state)
+{
+	struct udp_proxy_shard *shard = context;
+
+	if (_HA_ATOMIC_LOAD(&udp_proxy_nb_sessions) > 0)
+		udp_proxy_gc_all(shard);
+
+	task_schedule(t, tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_GC_INTERVAL_MS)));
+	return t;
 }
 
 static struct udp_proxy_session *udp_proxy_find_client(struct udp_proxy_shard *shard,
@@ -465,3 +495,23 @@ void udp_proxy_fd_handler(int fd)
 		udp_proxy_send_connected(sess, buf->area, ret);
 	} while (--max_accept);
 }
+
+static void udp_proxy_late_init(void)
+{
+	int i;
+
+	for (i = 0; i < global.nbthread; i++) {
+		udp_proxy_shard_init(&udp_proxy_shards[i]);
+		udp_proxy_gc_tasks[i] = task_new_on(i);
+		if (!udp_proxy_gc_tasks[i]) {
+			ha_alert("failed to allocate UDP proxy GC task.\n");
+			exit(1);
+		}
+		udp_proxy_gc_tasks[i]->process = udp_proxy_gc_task;
+		udp_proxy_gc_tasks[i]->context = &udp_proxy_shards[i];
+		task_schedule(udp_proxy_gc_tasks[i],
+		              tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_GC_INTERVAL_MS)));
+	}
+}
+
+INITCALL0(STG_INIT_2, udp_proxy_late_init);
