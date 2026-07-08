@@ -496,22 +496,21 @@ void udp_proxy_fd_handler(int fd)
 	} while (--max_accept);
 }
 
-static void udp_proxy_late_init(void)
+static int udp_proxy_thread_init(void)
 {
-	int i;
-
-	for (i = 0; i < global.nbthread; i++) {
-		udp_proxy_shard_init(&udp_proxy_shards[i]);
-		udp_proxy_gc_tasks[i] = task_new_on(i);
-		if (!udp_proxy_gc_tasks[i]) {
-			ha_alert("failed to allocate UDP proxy GC task.\n");
-			exit(1);
-		}
-		udp_proxy_gc_tasks[i]->process = udp_proxy_gc_task;
-		udp_proxy_gc_tasks[i]->context = &udp_proxy_shards[i];
-		task_schedule(udp_proxy_gc_tasks[i],
-		              tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_GC_INTERVAL_MS)));
+	udp_proxy_shard_init(&udp_proxy_shards[tid]);
+	udp_proxy_gc_tasks[tid] = task_new_here();
+	if (!udp_proxy_gc_tasks[tid]) {
+		ha_alert("failed to allocate UDP proxy GC task.\n");
+		return 0;
 	}
+
+	udp_proxy_gc_tasks[tid]->process = udp_proxy_gc_task;
+	udp_proxy_gc_tasks[tid]->context = &udp_proxy_shards[tid];
+	task_schedule(udp_proxy_gc_tasks[tid],
+	              tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_GC_INTERVAL_MS)));
+
+	return 1;
 }
 
-INITCALL0(STG_INIT_2, udp_proxy_late_init);
+REGISTER_PER_THREAD_INIT(udp_proxy_thread_init);
