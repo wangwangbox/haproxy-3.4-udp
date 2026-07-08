@@ -1,4 +1,4 @@
-/*
+﻿/*
  * AF_INET/AF_INET6 SOCK_STREAM protocol layer (tcp)
  *
  * Copyright 2000-2013 Willy Tarreau <w@1wt.eu>
@@ -59,7 +59,7 @@ smp_fetch_src(const struct arg *args, struct sample *smp, const char *kw, void *
 			src = conn_src(conn);
 	}
         else /* src */
-		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
+		src = (smp->strm && smp->strm->scf ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -103,7 +103,7 @@ smp_fetch_sport(const struct arg *args, struct sample *smp, const char *kw, void
 			src = conn_src(conn);
 	}
         else /* src_port */
-		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
+		src = (smp->strm && smp->strm->scf ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -149,7 +149,7 @@ smp_fetch_dst(const struct arg *args, struct sample *smp, const char *kw, void *
 			dst = conn_dst(conn);
 	}
         else /* dst */
-		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
+		dst = (smp->strm && smp->strm->scf ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -186,7 +186,7 @@ int smp_fetch_dst_is_local(const struct arg *args, struct sample *smp, const cha
 			dst = conn_dst(conn);
 	}
 	else /* dst_is_local */
-		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
+		dst = (smp->strm && smp->strm->scf ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -212,7 +212,7 @@ int smp_fetch_src_is_local(const struct arg *args, struct sample *smp, const cha
 			src = conn_src(conn);
 	}
 	else /* src_is_local */
-		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
+		src = (smp->strm && smp->strm->scf ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -245,7 +245,7 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 			dst = conn_dst(conn);
 	}
         else /* dst_port */
-		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
+		dst = (smp->strm && smp->strm->scf ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * "tcp" rules processing
  *
  * Copyright 2000-2016 Willy Tarreau <w@1wt.eu>
@@ -1494,6 +1494,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "tcp-request",  tcp_parse_tcp_req },
 	{ CFG_LISTEN, "tcp-response", tcp_parse_tcp_rep },
+	{ CFG_LISTEN, "udp-request",  tcp_parse_tcp_req },
 	{ 0, NULL, NULL },
 }};
 
