@@ -16,6 +16,12 @@
 #include <haproxy/chunk.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
+#include <haproxy/lb_chash.h>
+#include <haproxy/lb_fas.h>
+#include <haproxy/lb_fwlc.h>
+#include <haproxy/lb_fwrr.h>
+#include <haproxy/lb_map.h>
+#include <haproxy/lb_ss.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/obj_type.h>
@@ -136,20 +142,126 @@ static int udp_addr_match(const struct sockaddr_storage *a,
 	return ipcmp(a, b, 1) == 0;
 }
 
-static struct server *udp_proxy_pick_server(struct proxy *px)
+static int udp_proxy_srv_usable(const struct server *srv)
 {
-	struct server *srv, *fallback = NULL;
+	if (srv->addr.ss_family == AF_UNSPEC)
+		return 0;
+	if (srv->cur_admin & SRV_ADMF_MAINT)
+		return 0;
+	if ((srv->check.state & CHK_ST_CONFIGURED) && srv->cur_state == SRV_ST_STOPPED)
+		return 0;
+	return 1;
+}
+
+static struct server *udp_proxy_fallback_server(struct proxy *px)
+{
+	struct server *srv;
 
 	for (srv = px->srv; srv; srv = srv->next) {
-		if (srv->addr.ss_family == AF_UNSPEC)
-			continue;
-		if (srv->cur_state != SRV_ST_STOPPED)
+		if (udp_proxy_srv_usable(srv))
 			return srv;
-		if (!fallback && !(srv->cur_admin & SRV_ADMF_MAINT))
-			fallback = srv;
 	}
 
-	return fallback;
+	return NULL;
+}
+
+static struct server *udp_proxy_pick_lb_server(struct proxy *px,
+                                               const struct sockaddr_storage *client,
+                                               const void *payload, size_t payload_len)
+{
+	struct server *srv = NULL;
+	struct stream strm = { };
+
+	if (!px->lbprm.tot_weight)
+		return udp_proxy_fallback_server(px);
+
+	switch (px->lbprm.algo & BE_LB_LKUP) {
+	case BE_LB_LKUP_RRTREE:
+		srv = fwrr_get_next_server(px, NULL);
+		break;
+
+	case BE_LB_LKUP_FSTREE:
+		srv = fas_get_next_server(px, NULL);
+		break;
+
+	case BE_LB_LKUP_LCTREE:
+		srv = fwlc_get_next_server(px, NULL);
+		break;
+
+	case BE_LB_LKUP_CHTREE:
+	case BE_LB_LKUP_MAP:
+		if ((px->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_RR) {
+			if ((px->lbprm.algo & BE_LB_PARM) == BE_LB_RR_RANDOM) {
+				strm.be = px;
+				srv = get_server_rnd(&strm, NULL);
+			}
+			else
+				srv = map_get_server_rr(px, NULL);
+			break;
+		}
+
+		if ((px->lbprm.algo & BE_LB_KIND) != BE_LB_KIND_HI)
+			break;
+
+		switch (px->lbprm.algo & BE_LB_PARM) {
+		case BE_LB_HASH_SRC:
+			if (client->ss_family == AF_INET) {
+				srv = get_server_sh(px,
+				                    (void *)&((const struct sockaddr_in *)client)->sin_addr,
+				                    4, NULL);
+			}
+			else if (client->ss_family == AF_INET6) {
+				srv = get_server_sh(px,
+				                    (void *)&((const struct sockaddr_in6 *)client)->sin6_addr,
+				                    16, NULL);
+			}
+			break;
+
+		case BE_LB_HASH_RDP:
+		case BE_LB_HASH_SMP:
+			if (payload_len)
+				srv = get_server_sh(px, payload, payload_len, NULL);
+			break;
+		}
+
+		if (!srv) {
+			if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
+				srv = chash_get_next_server(px, NULL);
+			else
+				srv = map_get_server_rr(px, NULL);
+		}
+		break;
+
+	default:
+		if ((px->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_SA &&
+		    (px->lbprm.algo & BE_LB_PARM) == BE_LB_SA_SS)
+			srv = ss_get_server(px);
+		break;
+	}
+
+	return srv;
+}
+
+static void udp_proxy_take_server(struct server *srv)
+{
+	_HA_ATOMIC_INC(&srv->served);
+	_HA_ATOMIC_INC(&srv->proxy->served);
+	__ha_barrier_atomic_store();
+	if (srv->proxy->lbprm.ops && srv->proxy->lbprm.ops->server_take_conn)
+		srv->proxy->lbprm.ops->server_take_conn(srv);
+	if (srv->proxy->be_counters.shared.tg)
+		_HA_ATOMIC_INC(&srv->proxy->be_counters.shared.tg[tgid - 1]->cum_lbconn);
+	if (srv->counters.shared.tg)
+		_HA_ATOMIC_INC(&srv->counters.shared.tg[tgid - 1]->cum_lbconn);
+}
+
+static void udp_proxy_drop_server(struct server *srv)
+{
+	_HA_ATOMIC_DEC(&srv->proxy->served);
+	_HA_ATOMIC_DEC(&srv->served);
+	__ha_barrier_atomic_store();
+	if (srv->proxy->lbprm.ops && srv->proxy->lbprm.ops->server_drop_conn)
+		srv->proxy->lbprm.ops->server_drop_conn(srv);
 }
 
 static void udp_proxy_prune_bucket(struct udp_proxy_shard *shard, unsigned int bucket)
@@ -263,16 +375,19 @@ static void udp_proxy_delete_session(struct udp_proxy_session *sess)
 		fd_delete(sess->fd);
 		sess->fd = -1;
 	}
+	if (sess->srv)
+		udp_proxy_drop_server(sess->srv);
 	_HA_ATOMIC_DEC(&udp_proxy_nb_sessions);
 	free(sess);
 }
 
 static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
                                                        const struct sockaddr_storage *client,
-                                                       struct server *srv)
+                                                       const void *payload, size_t payload_len)
 {
 	struct udp_proxy_shard *shard = &udp_proxy_shards[tid];
 	struct udp_proxy_session *sess;
+	struct server *srv;
 	unsigned int hash;
 
 	udp_proxy_shard_init(shard);
@@ -281,8 +396,17 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 	hash = udp_proxy_hash_key(l, client);
 	udp_proxy_prune_bucket(shard, hash & UDP_PROXY_HASH_MASK);
 	sess = udp_proxy_find_client(shard, l, client, hash);
+	if (sess && !udp_proxy_srv_usable(sess->srv)) {
+		udp_proxy_delete_session(sess);
+		sess = NULL;
+	}
 	if (!sess) {
 		int limit = udp_proxy_session_limit(l);
+
+		srv = udp_proxy_pick_lb_server(l->bind_conf->frontend, client,
+		                               payload, payload_len);
+		if (!srv)
+			return NULL;
 
 		if (limit > 0 && _HA_ATOMIC_LOAD(&udp_proxy_nb_sessions) >= limit)
 			return NULL;
@@ -300,6 +424,7 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 				sess = NULL;
 			}
 			else {
+				udp_proxy_take_server(srv);
 				_HA_ATOMIC_INC(&udp_proxy_nb_sessions);
 				LIST_APPEND(&shard->buckets[hash & UDP_PROXY_HASH_MASK],
 				            &sess->by_hash);
@@ -307,7 +432,6 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 		}
 	}
 	if (sess) {
-		sess->srv = srv;
 		sess->expire = tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_SESS_TIMEOUT_MS));
 	}
 
@@ -346,12 +470,10 @@ static int udp_proxy_send_connected(struct udp_proxy_session *sess,
 void udp_proxy_fd_handler(int fd)
 {
 	struct listener *l = objt_listener(fdtab[fd].owner);
-	struct proxy *px;
 	struct buffer *buf = get_trash_chunk();
 	int max_accept;
 
 	BUG_ON(!l);
-	px = l->bind_conf->frontend;
 
 	if (!(fdtab[fd].state & FD_POLL_IN))
 		return;
@@ -363,7 +485,6 @@ void udp_proxy_fd_handler(int fd)
 		struct sockaddr_storage saddr = {0};
 		socklen_t saddrlen = sizeof(saddr);
 		struct udp_proxy_session *sess;
-		struct server *srv;
 		ssize_t ret;
 
 		ret = recvfrom(fd, buf->area, buf->size, 0,
@@ -376,10 +497,7 @@ void udp_proxy_fd_handler(int fd)
 			break;
 		}
 
-		srv = udp_proxy_pick_server(px);
-		if (!srv)
-			continue;
-		sess = udp_proxy_get_session(l, &saddr, srv);
+		sess = udp_proxy_get_session(l, &saddr, buf->area, ret);
 		if (!sess)
 			continue;
 		udp_proxy_send_connected(sess, buf->area, ret);
