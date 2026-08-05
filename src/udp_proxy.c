@@ -17,6 +17,7 @@
 #include <haproxy/backend-t.h>
 #include <haproxy/buf-t.h>
 #include <haproxy/chunk.h>
+#include <haproxy/check.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
 #include <haproxy/init.h>
@@ -46,6 +47,7 @@
 #define UDP_PROXY_HASH_SIZE (1U << UDP_PROXY_HASH_BITS)
 #define UDP_PROXY_HASH_MASK (UDP_PROXY_HASH_SIZE - 1)
 #define UDP_PROXY_GC_BUCKETS_PER_RUN 4
+#define UDP_PROXY_MAX_RECV_PER_RUN 64
 
 struct udp_proxy_session {
 	struct list by_hash;
@@ -194,6 +196,7 @@ static struct proxy *udp_proxy_eval_switching_rules(struct proxy *px,
 	LIST_INIT(&sess.priv_conns);
 	vars_init_head(&sess.vars, SCOPE_SESS);
 
+	strm.obj_type = OBJ_TYPE_STREAM;
 	strm.sess = &sess;
 	strm.be = px;
 	strm.rules_exp = TICK_ETERNITY;
@@ -228,21 +231,9 @@ static int udp_proxy_srv_usable(const struct server *srv)
 		return 0;
 	if (srv->cur_admin & SRV_ADMF_MAINT)
 		return 0;
-	if ((srv->check.state & CHK_ST_CONFIGURED) && srv->cur_state == SRV_ST_STOPPED)
+	if (srv->cur_state == SRV_ST_STOPPED)
 		return 0;
 	return 1;
-}
-
-static struct server *udp_proxy_fallback_server(struct proxy *px)
-{
-	struct server *srv;
-
-	for (srv = px->srv; srv; srv = srv->next) {
-		if (udp_proxy_srv_usable(srv))
-			return srv;
-	}
-
-	return NULL;
 }
 
 static struct server *udp_proxy_pick_lb_server(struct proxy *px,
@@ -253,7 +244,7 @@ static struct server *udp_proxy_pick_lb_server(struct proxy *px,
 	struct stream strm = { };
 
 	if (!px->lbprm.tot_weight)
-		return udp_proxy_fallback_server(px);
+		return NULL;
 
 	switch (px->lbprm.algo & BE_LB_LKUP) {
 	case BE_LB_LKUP_RRTREE:
@@ -404,6 +395,7 @@ static void udp_proxy_session_fd_handler(int fd)
 {
 	struct udp_proxy_session *sess = fdtab[fd].owner;
 	struct buffer *buf = get_trash_chunk();
+	int max_recv = UDP_PROXY_MAX_RECV_PER_RUN;
 
 	if (!sess)
 		return;
@@ -412,29 +404,47 @@ static void udp_proxy_session_fd_handler(int fd)
 	if (!fd_recv_ready(fd))
 		return;
 
-	while (1) {
+	do {
 		ssize_t ret;
 
 		ret = recv(fd, buf->area, buf->size, 0);
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				fd_cant_recv(fd);
-			break;
+				return;
+			}
+
+			/* Connected UDP sockets report asynchronous ICMP errors here.
+			 * Leaving such an FD registered makes the poller wake up forever.
+			 */
+			health_adjust(sess->srv, HANA_STATUS_L4_ERR);
+			udp_proxy_delete_session(sess);
+			return;
 		}
 
+		health_adjust(sess->srv, HANA_STATUS_L4_OK);
 		sess->expire = tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_SESS_TIMEOUT_MS));
 		udp_proxy_sendto(sess->listener->rx.fd, buf->area, ret, &sess->client);
-	}
+	} while (--max_recv);
 }
 
 static int udp_proxy_connect_session(struct udp_proxy_session *sess)
 {
 	struct sockaddr_storage addr;
+	uint16_t port;
 	int fd;
 
-	fd = socket(sess->srv->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+	HA_SPIN_LOCK(SERVER_LOCK, &sess->srv->lock);
+	addr = sess->srv->addr;
+	port = sess->srv->svc_port;
+	HA_SPIN_UNLOCK(SERVER_LOCK, &sess->srv->lock);
+
+	if (addr.ss_family == AF_UNSPEC)
+		return 0;
+
+	fd = socket(addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
 	if (fd == -1)
 		return 0;
 	if (fd >= global.maxsock) {
@@ -449,8 +459,7 @@ static int udp_proxy_connect_session(struct udp_proxy_session *sess)
 		setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.backend_sndbuf,
 		           sizeof(global.tune.backend_sndbuf));
 
-	addr = sess->srv->addr;
-	set_host_port(&addr, sess->srv->svc_port);
+	set_host_port(&addr, port);
 	if (connect(fd, (struct sockaddr *)&addr, get_addr_len(&addr)) == -1) {
 		close(fd);
 		return 0;
@@ -563,6 +572,7 @@ static int udp_proxy_send_connected(struct udp_proxy_session *sess,
 	if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
 		return 0;
 
+	health_adjust(sess->srv, HANA_STATUS_L4_ERR);
 	udp_proxy_delete_session(sess);
 	return -1;
 }

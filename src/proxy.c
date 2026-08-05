@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Proxy variables and functions.
  *
  * Copyright 2000-2009 Willy Tarreau <w@1wt.eu>
@@ -1823,6 +1823,12 @@ int proxy_finalize(struct proxy *px, int *err_code)
 #endif /* USE_QUIC */
 
 		/* finish the bind setup */
+		/* UDP proxy sessions are stored per thread. A per-thread reuseport
+		 * shard keeps every client flow on the thread that owns its session.
+		 */
+		if (px->mode == PR_MODE_UDP)
+			bind_conf->settings.shards = -1;
+
 		ret = bind_complete_thread_setup(bind_conf, err_code);
 		if (ret != 0) {
 			cfgerr += ret;
