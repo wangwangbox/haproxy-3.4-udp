@@ -513,17 +513,15 @@ ifneq ($(USE_THREAD:0=),)
   endif
 endif
 
-#### Determine version, sub-version and release date.
-# If GIT is found, and IGNOREGIT is not set, VERSION, SUBVERS and VERDATE are
-# extracted from the last commit. Otherwise, use the contents of the files
-# holding the same names in the current directory.
+#### Determine version, sub-version and build date.
+# If GIT is found, and IGNOREGIT is not set, VERSION and SUBVERS are extracted
+# from the last commit. Otherwise, use the files holding the same names.
 
 ifeq ($(IGNOREGIT),)
   VERSION := $(shell [ -d .git/. ] && (git describe --tags --match 'v*' --abbrev=0 | cut -c 2-) 2>/dev/null)
   ifneq ($(VERSION),)
     # OK git is there and works.
     SUBVERS := $(shell comms=`git log --format=oneline --no-merges v$(VERSION).. 2>/dev/null | wc -l | tr -d '[:space:]'`; commit=`(git log -1 --pretty=%h --abbrev=6) 2>/dev/null`; [ $$comms -gt 0 ] && echo "-$$commit-$$comms")
-    VERDATE := $(shell git log -1 --pretty=format:%ci | cut -f1 -d' ' | tr '-' '/')
   endif
 endif
 
@@ -534,8 +532,10 @@ endif
 ifeq ($(SUBVERS),)
   SUBVERS := $(shell (grep -v '\$$Format' SUBVERS 2>/dev/null || touch SUBVERS) | head -n 1)
 endif
-ifeq ($(VERDATE),)
-  VERDATE := $(shell (grep -v '^\$$Format' VERDATE 2>/dev/null || touch VERDATE) | head -n 1 | cut -f1 -d' ' | tr '-' '/')
+# Keep the release version unchanged, but report the UTC date of this build.
+# A command-line VERDATE remains available for reproducible package builds.
+ifeq ($(origin VERDATE), undefined)
+  VERDATE := $(shell date -u '+%Y/%m/%d')
 endif
 
 # this one is always empty by default and appended verbatim
