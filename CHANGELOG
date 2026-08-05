@@ -1,6 +1,163 @@
 ChangeLog :
 ===========
 
+2026/07/29 : 3.4.3
+    - BUG/MEDIUM: h3: fix parser desync on error with multiple frames
+    - BUG/MINOR: mux_quic: prevent multiple STOP_SENDING emission per stream
+    - BUILD: quic: workaround a gcc bug saying "maybe used uninitialized" when USE_TRACE=0
+    - CLEANUP: traces: get rid of a few rare empty args in TRACE calls
+    - MINOR: compiler: add a macro to ignore all arguments
+    - MINOR: trace: always pretend to use args when disabled
+    - BUG/MINOR: trace/quic_frame: use buf, not trace_buf in chunk_frm_appendf()
+    - BUG/MEDIUM: mux_quic: do not free QCS if STOP_SENDING to sent
+    - MINOR: mux_quic: use separate error code for STOP_SENDING
+    - BUG/MEDIUM: mux_quic: complete stream shutdown for read channel
+    - BUG/MINOR: quic: ignore STREAM after MUX closure on BE side
+    - BUG/MEDIUM: fd: Fix a deadlock when closing other tgroups fds
+    - BUG/MEDIUM: tcpcheck: Add proxy used for healthcheck sections in proxies list
+    - BUG/MINOR: sample: Fix a possible underflow on be2hex for large chunk size
+    - MINOR: chunks: Add function to get a large/regular chunk depending on a buffer
+    - BUG/MEDIUM: chunk: Review chunks usage to not retrieve a large buffer by error
+    - MINOR: htx: Add a field to save the headers data size
+    - MEDIUM: htx: Be sure size of headers never exceed regular buffer on update
+    - BUG/MINOR: stream: Fix custom timeouts initialization when setting backend
+    - REGTESTS: Improve script testing the set-timeout action
+    - BUG/MINOR: stream: Fix custom max-retries initialization when setting backend
+    - BUG/MINOR: http-conv: Make url-dec failed if no space for trailing null byte
+    - MINOR: haterm: add note about QUIC usage on SSL port
+    - BUG/MINOR: hlua: Apply socket timeout on server side only
+    - BUG/MEDIUM: applet: Reenable reads in applet context if requesting a connection
+    - MINOR: stats: factor the proxy vs scope check into its own function
+    - BUG/MEDIUM: stats: subject "stats admin" accesses to "stats scope" filtering
+    - BUG/MINOR: shctx: fix shctx_row_data_get() when offset exceeds a block
+    - MINOR: shctx: clamp shctx_row_data_get() reads against the offset
+    - DOC: stats: document the per-proxy byte count fields in the CSV list
+    - BUG/MEDIUM: cache: reattach the row when a secondary entry is incomplete
+    - BUG/MEDIUM: stats: Ensure that Origin is valid on POSTs
+    - DOC: stats: Document that stats admin is vulnerable to a CSRF attack
+    - BUG/MEDIUM: ssl-gencert: Don't forget to free memory when done
+    - BUG/MEDIUM: protobuf: adjust sample size capacity after pointer shift
+    - BUG/MEDIUM: protobuf: fix nested path bypass in field lookup
+    - BUG/MINOR: ssl: fix proxy lookup for show ssl sni
+    - REGTESTS: protobuf: add regression test for nested vs flat paths
+    - BUG/MINOR: mux-h1: Don't delay send if message with c-l was fully sent
+    - BUG/MEDIUM: net-helper: Adjust sample size capacity after pointer shift
+    - BUG/MEDIUM: sample: Adjust sample size capacity after pointer shift for bytes()
+    - BUG/MEDIUM: sample: Adjust sample size capacity after pointer shift for ltrim()
+    - BUG/MINOR: sample: Fix bytes() when length it greater than remaining data
+    - DOC: fix typo in "del ssl ech" command
+    - DOC: remove outdated experimental mention on dynamic backends
+    - BUG/MEDIUM: proxy: protect "show servers ..." against server deletion
+    - BUG/MEDIUM: proxy: protect "show servers ..." against backend deletion
+    - BUG/MEDIUM: proxy: protect show backend against be deletion
+    - BUG/MEDIUM: server: Properly check for streams before deletion
+    - BUG/MINOR: resolvers: do not index resolvers names in the proxies
+    - BUG/MEDIUM: proxy: protect "show errors" against backend deletion
+    - BUG/MEDIUM: ssl: Spell HAVE_VANILLA_OPENSSL correctly
+    - BUG/MEDIUM: ssl: Handle non-application data record while splicing
+    - DEBUG: fd: catch access attempts to closed FDs
+    - REORG: h1-htx: Move h1 headers map in h1-htx
+    - BUG/MEDIUM: mux-h1: Always adjust case for all outgoing headers as expected
+    - BUG/MINOR: http-htx: fix the length moved when removing a header value
+    - BUG/MEDIUM: http-fetch: don't parse a non-HTTP check buffer as an HTX message
+    - BUG/MEDIUM: http-fetch: reject a negative capture id in capture.{req,res}.hdr
+    - BUG/MINOR: http-fetch: fix a NULL channel dereference in smp_fetch_body()
+    - BUG/MINOR: http: fix an out-of-bounds read in http_get_host_port() on empty host
+    - BUG/MINOR: http-htx: check the trash allocation in http_scheme_based_normalize()
+    - BUG/MINOR: h1: report the right error position on authority/host mismatch
+    - BUG/MINOR: h2: don't use a block pointer to roll back a partial HTX conversion
+    - BUG/MINOR: h3: don't use a block pointer to roll back a partial HTX conversion
+    - BUG/MINOR: http-ana: fix a one-byte over-read in the client-side cookie parser
+    - BUG/MINOR: http-act: fix a double free of the regex on a rule parsing error
+    - BUG/MINOR: http-act: fix a double free of the map reference on a parsing error
+    - BUG/MINOR: http-act: restore the response buffer state in the early-hint action
+    - BUG/MINOR: http-act: work on a copy of the sample in del-headers-bin
+    - BUG/MINOR: http-act: reject a negative capture id in the capture actions
+    - BUG/MINOR: http-htx: check the strdup() of the "lf-string" http reply argument
+    - BUG/MEDIUM: tools: make string encoding possible to fail instead of truncating
+    - BUG/MINOR: htx: Perform raw copy for messages of same size in htx_copy_msg()
+    - BUG/MINOR: htx: Transfer HTX_FL_EOM flag on success in htx_append_msg()
+    - BUG/MINOR: http-rules: fix release of a failed "set-cookie-fmt" redirect rule
+    - BUG/MINOR: slz: do not read past the end of the input around the match loop
+    - CLEANUP: slz: fix the documented worst case size of flush() and finish()
+    - BUG/MINOR: slz: use the exact switch cost for the last literals of a block
+    - BUG/MEDIUM: slz: bound the bits wasted by the 9-bit literals
+    - BUG/MINOR: slz: do not append a block to an already finished stream
+    - BUG/MINOR: slz: fix the adler32 accumulators signedness on 32-bit
+    - BUG/MINOR: slz: avoid undefined shifts when building the word byte by byte
+    - CLEANUP: slz: clarify that the size promise applies to the stream, not to a call
+    - MEDIUM: ssl: Add a way to rate-limit TLSv1.3 KeyUpdate
+    - DOC: ssl: Document tune.ssl.keyupdate-rate-limit
+    - BUG/MEDIUM: ssl: Put CO_ER_SSL_KEYUPDATE at the right place
+    - BUILD: ssl: Do not use SSL3_MT_KEY_UPDATE, hardcode 24 instead
+    - BUG/MEDIUM: peers: check the available room before encoding dict values
+    - BUG/MEDIUM: sample: reject the deprecated protobuf group wire types
+    - BUG/MAJOR: ssl/ocsp: lock the OCSP response around reads in the stapling callback
+    - MINOR: server: improve parsing error for server-template
+    - BUG/MINOR: server: fix QUIC on server-template
+    - BUG/MINOR: server: duplicate server alt_proto in srv_settings_cpy()
+    - BUG/MINOR: server: fix check reuse-pool in srv_settings_cpy()
+    - IMPORT: cebtree: private: fix the duplicate detection in the lookup shortcut
+
+2026/07/03 : 3.4.2
+    - BUG/MEDIUM: mux_quic: fix memory leak of rx app_buf on stream free
+    - BUG/MINOR: hq-interop: fix transcoding of wrapping response buffer
+    - BUG/MINOR: hq-interop: support transcoding of absolute URI
+    - BUG/MEDIUM: server: initialise agent.health in srv_settings_init()
+    - BUG/MINOR: sample: set SMP_F_CONST on srv_name fetch
+    - BUG/MEDIUM: servers: Use a refcount for port_range and free it properly
+    - MINOR: hbuf: new lightweight hbuf API
+    - BUG/MINOR: init: fix default global settings being overwritten by -G
+    - BUG/MINOR: tools: fix invalid character detection in strl2ic()
+    - BUG/MAJOR: htx: Don't swap buffers for empty HTX message with an error
+    - BUG/MINOR: mux-quic: Fix handling EOM after in qcs_http_rcv_buf()
+    - BUG/MINOR: http-htx: Don't by-pass HTX API when merging cookie values
+
+2026/06/25 : 3.4.1
+    - BUG/MEDIUM: check: Skip tcpcheck post-config for external checks
+    - BUG/MEDIUM: check: Ignore small-buffer option when starting an external check
+    - MINOR: check: Don't dump buffers state in check traces for external checks
+    - BUG/MEDIUM: server/checks: Support healtcheck keyword on default-server lines
+    - BUG/MEDIUM: mux_quic: prevent risk of infinite loop on recv
+    - BUG/MINOR: mux_quic: do not interrupt recv on error/incomplete data
+    - BUG/MINOR: tcpcheck: Override external check if healthcheck section is set
+    - REGTESTS: checks: Add script for external healthchecks
+    - BUG/MEDIUM: regex: initialize the match array earlier during boot
+    - BUG/MEDIUM: threads: Fiw build when using no thread
+    - BUG/MEDIUM: xprt_qmux: implement ->get_ssl_sock_ctx() to get the SSL laye
+    - CLEANUP: sessions: simplify the sess_priv_conns pool name
+    - BUG/MINOR: acl: report "ACL" not "map" in ACL ID lookup failures
+    - BUG/MEDIUM: checks: Dequeue checks on purge
+    - REGTESTS: Fix log matching in healthcheck-section.vtc
+    - BUG/MINOR: quic: fix Initial length value in sent packets
+    - BUG/MEDIUM: acme: stuck ACME task when authz is already "valid"
+    - BUG/MEDIUM: ktls: defer enabling TLS ULP on a socket until connected
+    - MINOR: errors: add ha_diag_notice() to report diag-level notifications
+    - BUG/MINOR: cpu-topo: use ha_diag_notice() to report thread creations
+    - BUG/MEDIUM: h3: Properly handle PUSH_PROMISE on backend connections
+    - BUG/MINOR: server: fix add server with consistent hash balancing
+    - BUG/MINOR: http-ana: Remove a debugging memset on redirect
+    - BUG/MEDIUM: http-ana: Don't ignore L7 retry errors
+    - BUG/MINOR: mux-h1: Properly resolve file path for 'h1-case-adjust-file'
+    - BUG/MINOR: quic: fix rxbuf settings on backend side
+    - BUG/MEDIUM: ssl: Don't free the early data buffer too early
+    - BUG/MINOR: hpack-tbl: add missing NULL check after hpack_dht_defrag()
+    - BUG/MEDIUM: mux_quic: fix freeze transfer after QCS rxbuf realign
+    - BUG/MEDIUM: http-act: Make a copy of the sample expr in (set/add)-headers-bin
+    - BUG/MEDIUM: mux-fcgi: fix uint16_t overflow in drl += drp
+    - BUG/MINOR: hq-interop: reject too big content
+    - BUG/MINOR: hq-interop: prevent reset if missing content-length
+    - BUG/MEDIUM: hlua: Properly report EOS when http applet exits
+    - BUG/MINOR: hq-interop: support full demux buf on large response
+    - BUG/MINOR: hq-interop: support response buffer wrapping
+    - DOC: lua: remove incorrect init tags
+    - BUG/MEDIUM: h3: increment unknown request payload length
+    - REGTESTS: quic: test H3 request without content-length
+    - BUG/MEDIUM: mux-fcgi: Truly drain outgoing HTX data when the stream is closed
+    - BUG/MEDIUM: mux-h2: Truly drain outgoing HTX data when the stream is closed
+    - BUG/MEDIUM: mux-spop: Truly drain outgoing data when the stream is closed
+    - BUG/MEDIUM: mux-quic: Drain the given amount of data in qcs_http_reset_buf()
+
 2026/06/03 : 3.4.0
     - BUG/MINOR: tcpcheck: Check LDAP response to not read more data than available
     - BUG/MINOR: ssl-gencert: validate SNI characters to prevent SAN certificate injection

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Server management functions.
  *
  * Copyright 2000-2012 Willy Tarreau <w@1wt.eu>
@@ -2096,7 +2096,13 @@ static int srv_parse_strict_maxconn(char **args, int *cur_arg, struct proxy *px,
 /* Returns 1 if the server has streams pointing to it, and 0 otherwise. */
 static int srv_has_streams(struct server *srv)
 {
-	return !!_HA_ATOMIC_LOAD(&srv->served);
+	int i;
+
+	for (i = 0; i < global.nbtgroups; i++) {
+		if (_HA_ATOMIC_LOAD(&srv->per_tgrp[i].nb_strm))
+			return 1;
+	}
+	return 0;
 }
 
 /* Shutdown all connections of a server. The caller must pass a termination
@@ -2889,7 +2895,7 @@ void srv_settings_init(struct server *srv)
 	srv->agent.inter = DEF_CHKINTR;
 	srv->agent.fastinter = 0;
 	srv->agent.downinter = 0;
-	srv->agent.rise = DEF_AGENT_RISETIME;
+	srv->agent.rise = srv->agent.health = DEF_AGENT_RISETIME;
 	srv->agent.fall = DEF_AGENT_FALLTIME;
 	srv->agent.port = 0;
 
@@ -2948,6 +2954,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 		srv->addr = src->addr;
 		srv->addr_type = src->addr_type;
 		srv->svc_port = src->svc_port;
+		srv->alt_proto = src->alt_proto;
 	}
 
 	srv->pp_opts = src->pp_opts;
@@ -2992,8 +2999,12 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 			srv->check.tcpcheck = tcpcheck;
 	}
 
-	if (!(srv->flags & SRV_F_RHTTP))
-		srv->check.reuse_pool = src->check.reuse_pool;
+	/* For rHTTP check-reuse-pool is forcefully set. Duplicate the source
+	 * value in other cases as expected.
+	 */
+	srv->check.reuse_pool = srv->flags & SRV_F_RHTTP ?
+	                        1 : src->check.reuse_pool;
+
 	if (src->check.pool_conn_name)
 		srv->check.pool_conn_name = strdup(src->check.pool_conn_name);
 	/* Note: 'flags' field has potentially been already initialized. */
@@ -3246,6 +3257,7 @@ void srv_free_params(struct server *srv)
 		ha_free(&srv_tlv->fmt_string);
 		ha_free(&srv_tlv);
 	}
+	port_range_release(srv->conn_src.sport_range);
 }
 
 /* Deallocate a server <srv> and its member. <srv> must be allocated. For
@@ -3802,10 +3814,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
-
-			mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
-			newsrv->xprt = xprt_get(XPRT_QUIC);
-			quic_transport_params_init(&newsrv->quic_params, 0);
 		}
 #else
 		if (srv_is_quic(newsrv)) {

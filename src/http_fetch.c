@@ -1,4 +1,4 @@
-/*
+﻿/*
  * HTTP samples fetching
  *
  * Copyright 2000-2018 Willy Tarreau <w@1wt.eu>
@@ -207,6 +207,12 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 	BUG_ON(check && (s || chn));
 	if (!s || !chn) {
 		if (check) {
+			/* The check input buffer only contains an HTX message for
+			 * an HTTP check.
+			 */
+			if (!IS_HTX_SC(check->sc))
+				return NULL;
+
 			htx = htxbuf(&check->bi);
 
 			/* Analyse not yet started */
@@ -553,7 +559,7 @@ static int smp_fetch_hdrs(const struct arg *args, struct sample *smp, const char
 			struct ist n = htx_get_blk_name(htx, blk);
 			struct ist v = htx_get_blk_value(htx, blk);
 
-			if (!h1_format_htx_hdr(n, v, temp))
+			if (!h1_format_htx_hdr(n, v, temp, NULL))
 				return 0;
 		}
 		else if (type == HTX_BLK_EOH) {
@@ -679,8 +685,11 @@ static int smp_fetch_body(const struct arg *args, struct sample *smp, const char
 				/* More than one DATA block we must use a trash */
 				if (!chk) {
 					smp->flags &= ~SMP_F_CONST;
-					chk = get_trash_chunk_sz(htx->data);
-					if (!chunk_istcat(chk, body))
+					/* <chn> is NULL in the health-check context,
+					 * where the message comes from <check->bi>
+					 */
+					chk = get_best_trash_chunk((chn ? &chn->buf : &check->bi), htx->data);
+					if (!chk || !chunk_istcat(chk, body))
 						return 0;
 				}
 				if (!chunk_istcat(chk, htx_get_blk_value(htx, blk)))
@@ -2122,8 +2131,8 @@ static int smp_fetch_body_param(const struct arg *args, struct sample *smp, cons
 				if (isttest(body)) {
 					/* More than one DATA block we must use a trash */
 					if (!chk) {
-						chk = get_trash_chunk_sz(htx->data);
-						if (!chunk_istcat(chk, body))
+						chk = get_best_trash_chunk(&chn->buf, htx->data);
+						if (!chk || !chunk_istcat(chk, body))
 							break;
 					}
 					if (!chunk_istcat(chk, htx_get_blk_value(htx, blk)))
@@ -2277,6 +2286,23 @@ int val_hdr(struct arg *arg, char **err_msg)
 	return 1;
 }
 
+/* This function is used to validate the argument passed to the
+ * "capture.req.hdr" and "capture.res.hdr" fetch keywords. The capture
+ * identifier is used as an index in the stream's captures array, so it must not
+ * be negative. It is assumed that the type is already the correct one. Returns
+ * 0 on error, non-zero if OK. If <err_msg> is not NULL, it will be filled with a
+ * pointer to an error message in case of error, that the caller is responsible
+ * for freeing. The initial location must either be freeable or NULL.
+ */
+static int val_cap_id(struct arg *arg, char **err_msg)
+{
+	if (arg && arg[0].type == ARGT_SINT && arg[0].data.sint < 0) {
+		memprintf(err_msg, "capture identifier must be >= 0");
+		return 0;
+	}
+	return 1;
+}
+
 int val_query(struct arg *args, char **err_msg)
 {
 	int val = 0;
@@ -2315,14 +2341,14 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "baseq",              smp_fetch_base,               0,                NULL,   SMP_T_STR,  SMP_USE_HRQHV },
 
 	/* capture are allocated and are permanent in the stream */
-	{ "capture.req.hdr",    smp_fetch_capture_req_hdr,    ARG1(1,SINT),     NULL,   SMP_T_STR,  SMP_USE_HRQHP },
+	{ "capture.req.hdr",    smp_fetch_capture_req_hdr,    ARG1(1,SINT),     val_cap_id, SMP_T_STR,  SMP_USE_HRQHP },
 
 	/* retrieve these captures from the HTTP logs */
 	{ "capture.req.method", smp_fetch_capture_req_method, 0,                NULL,   SMP_T_STR,  SMP_USE_HRQHP },
 	{ "capture.req.uri",    smp_fetch_capture_req_uri,    0,                NULL,   SMP_T_STR,  SMP_USE_HRQHP },
 	{ "capture.req.ver",    smp_fetch_capture_req_ver,    0,                NULL,   SMP_T_STR,  SMP_USE_HRQHP },
 
-	{ "capture.res.hdr",    smp_fetch_capture_res_hdr,    ARG1(1,SINT),     NULL,   SMP_T_STR,  SMP_USE_HRSHP },
+	{ "capture.res.hdr",    smp_fetch_capture_res_hdr,    ARG1(1,SINT),     val_cap_id, SMP_T_STR,  SMP_USE_HRSHP },
 	{ "capture.res.ver",    smp_fetch_capture_res_ver,    0,                NULL,   SMP_T_STR,  SMP_USE_HRQHP },
 
 	/* cookie is valid in both directions (eg: for "stick ...") but cook*

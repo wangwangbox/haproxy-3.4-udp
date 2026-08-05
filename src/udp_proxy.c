@@ -315,6 +315,7 @@ static struct server *udp_proxy_pick_lb_server(struct proxy *px,
 
 static void udp_proxy_take_server(struct server *srv)
 {
+	_HA_ATOMIC_INC(&srv->per_tgrp[tgid - 1].nb_strm);
 	_HA_ATOMIC_INC(&srv->served);
 	_HA_ATOMIC_INC(&srv->proxy->served);
 	__ha_barrier_atomic_store();
@@ -330,6 +331,7 @@ static void udp_proxy_drop_server(struct server *srv)
 {
 	_HA_ATOMIC_DEC(&srv->proxy->served);
 	_HA_ATOMIC_DEC(&srv->served);
+	_HA_ATOMIC_DEC(&srv->per_tgrp[tgid - 1].nb_strm);
 	__ha_barrier_atomic_store();
 	if (srv->proxy->lbprm.ops && srv->proxy->lbprm.ops->server_drop_conn)
 		srv->proxy->lbprm.ops->server_drop_conn(srv);

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2013-2015 Willy Tarreau <w@1wt.eu>
  *
  * Permission is hereby granted, free of charge, to any person obtaining
@@ -507,12 +507,45 @@ static void reset_refs(union ref *refs, long count)
 	} while (refs < end);
 }
 
+/* Number of bits wasted by the 9-bit literals above which it becomes
+ * preferable to send the pending literals as a stored block. It corresponds to
+ * the cost of leaving the fixed huffman encoding and coming back to it: EOB
+ * (7 bits) + block type (3 bits) + alignment (up to 7 bits) + LEN and NLEN
+ * (32 bits) + block type of the next block (3 bits), that is 52 bits. Two
+ * cheaper variants are needed for the last literals of a block: nothing
+ * follows the stored block while the huffman encoding still has to send an EOB
+ * (10 bits less), and if the stream is still in EOB state, no EOB has to be
+ * sent and the block type is needed in both cases (10 more bits less). Using a
+ * larger value than these would leave the output larger than the same data
+ * sent as stored blocks, in violation of the promise made above.
+ */
+#define SLZ_SWITCH_COST      52
+#define SLZ_LAST_COST        42
+#define SLZ_LAST_COST_EOB    32
+
+/* Maximum number of bits the fixed huffman encoding is allowed to be behind
+ * the equivalent stored blocks before the encoder stops trusting the local
+ * decisions above and falls back to stored blocks only (see <debt> in
+ * slz_rfc1951_encode_blk()). This bounds by 25 bytes the amount by which a
+ * stream may exceed the size of the same data sent as stored blocks. It must
+ * be large enough not to trigger on regular data, where the debt oscillates
+ * around zero: measured on the 212 MB silesia.tar, no value from 196 up
+ * changes the output by a single byte, while 52 costs 2331 bytes and 192
+ * costs 615. It must also leave room for one last group of literals in the
+ * 8-bit counter that holds the debt, which is why it may not exceed
+ * 255 - (SLZ_SWITCH_COST - 1) = 204.
+ */
+#define SLZ_MAX_DEBT        200
+
 /* Compresses <ilen> bytes from <in> into <out> according to RFC1951. The
  * output result may be up to 5 bytes larger than the input for each 65535
  * nput bytes, to which 2 extra bytes may be added to send the last chunk due
- * to BFINAL+EOB encoding (10 bits) when <more> is not set. The caller is
- * responsible for ensuring there is enough room in the output buffer for this.
- * The amount of output bytes is returned, and no CRC is computed.
+ * to BFINAL+EOB encoding (10 bits) when <more> is not set. This is a property
+ * of the whole stream, not of each call: since up to 31 bits are retained in
+ * the queue from one call to the next, a single call may emit up to 5 bytes
+ * more than its own share, which the following ones will not emit. The caller
+ * is responsible for ensuring there is enough room in the output buffer for
+ * this. The amount of output bytes is returned, and no CRC is computed.
  */
 long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsigned char *in, long ilen, int more)
 {
@@ -542,11 +575,12 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 	strm->outbuf = out;
 
 #ifndef UNALIGNED_FASTER
-	word = ((unsigned char)in[pos] << 8) + ((unsigned char)in[pos + 1] << 16) + ((unsigned char)in[pos + 2] << 24);
+	if (rem >= 4)  // <word> is only used inside the loop below, hence the test for >= 4
+		word = ((uint32_t)(unsigned char)in[pos] << 8) + ((uint32_t)(unsigned char)in[pos + 1] << 16) + ((uint32_t)(unsigned char)in[pos + 2] << 24);
 #endif
 	while (rem >= 4) {
 #ifndef UNALIGNED_FASTER
-		word = ((unsigned char)in[pos + 3] << 24) + (word >> 8);
+		word = ((uint32_t)(unsigned char)in[pos + 3] << 24) + (word >> 8);
 #else
 		word = *(uint32_t *)&in[pos];
 #endif
@@ -690,7 +724,8 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 		 * is what guarantees that once switched to FIXED we can stay
 		 * in it for as long as needed.
 		 */
-		if (strm->state == SLZ_ST_EOB && (dist & 0x1f) + (code >> 16) + 52 > 8 * mlen)
+		if ((strm->state == SLZ_ST_EOB || strm->debt >= SLZ_MAX_DEBT) &&
+		    (dist & 0x1f) + (code >> 16) + SLZ_SWITCH_COST > 8 * mlen)
 			goto send_as_lit;
 
 		/* first, copy pending literals */
@@ -700,12 +735,17 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 			 * and no-comp then huffman consumes 52 bits (7 for EOB + 3 for
 			 * block type + 7 for alignment + 32 for LEN+NLEN + 3 for next
 			 * block. Only use plain literals if there are more than 52 bits
-			 * to save then.
+			 * to save then, or if we're already too much in debt, in which
+			 * case only stored blocks may be emitted, see <debt> below.
+			 * Literals sent in a stored block do not cost anything extra,
+			 * only those sent in huffman mode add to the debt.
 			 */
-			if (bit9 >= 52)
+			if (bit9 >= SLZ_SWITCH_COST || strm->debt >= SLZ_MAX_DEBT)
 				copy_lit(strm, in + pos - plit, plit, 1);
-			else
+			else {
 				copy_lit_huff(strm, in + pos - plit, plit, 1);
+				strm->debt += bit9;
+			}
 
 			plit = 0;
 		}
@@ -721,16 +761,41 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 
 		/* in fixed huffman mode, dist is fixed 5 bits */
 		enqueue24(strm, dist >> 5, dist & 0x1f);
+
+		/* <bit9> only measures the current group of literals, which is
+		 * what the decisions above compare against, and it restarts
+		 * from zero after each reference. <debt> accumulates how much
+		 * the literals already emitted in fixed huffman mode are still
+		 * costing us compared to the same bytes sent as stored blocks,
+		 * and is what bounds the growth of the output: the reference
+		 * just used (code>>16)+(dist&0x1f) bits in place of the 8*mlen
+		 * bits these bytes would have taken as literals, so it repays
+		 * that much of the debt. Without this, a stream made of series
+		 * of 9-bit literals interleaved with cheap references would
+		 * never reach the threshold above and would keep inflating. The
+		 * debt is saturated at zero since we're not interested in
+		 * accumulating credits. The update is unconditional because a
+		 * test on a debt that is often null but not always turns into
+		 * a mispredicted branch on binary data.
+		 */
+		code = strm->debt + (code >> 16) + (dist & 0x1f);
+		strm->debt = (code > 8 * (uint32_t)mlen) ? code - 8 * (uint32_t)mlen : 0;
+
 		bit9 = 0;
 		rem -= mlen;
 		pos += mlen;
 
 #ifndef UNALIGNED_FASTER
+		/* same as before the loop, this is only used when continuing
+		 * in the loop, so let's use the same condition (rem>=4).
+		 */
+		if (rem >= 4) {
 #ifdef UNALIGNED_LE_OK
-		word = *(uint32_t *)&in[pos - 1];
+			word = *(uint32_t *)&in[pos - 1];
 #else
-		word = ((unsigned char)in[pos] << 8) + ((unsigned char)in[pos + 1] << 16) + ((unsigned char)in[pos + 2] << 24);
+			word = ((uint32_t)(unsigned char)in[pos] << 8) + ((uint32_t)(unsigned char)in[pos + 1] << 16) + ((uint32_t)(unsigned char)in[pos + 2] << 24);
 #endif
+		}
 #endif
 	}
 
@@ -743,9 +808,19 @@ long slz_rfc1951_encode(struct slz_stream *strm, unsigned char *out, const unsig
 	}
 
  final_lit_dump:
-	/* now copy remaining literals or mark the end */
+	/* Now copy remaining literals or mark the end. The cost of switching to
+	 * a stored block depends on the current state and on the presence of
+	 * data after these literals, see the SLZ_*_COST definitions above.
+	 */
 	if (plit) {
-		if (bit9 >= 52)
+		uint32_t cost;
+
+		if (more)
+			cost = SLZ_SWITCH_COST;
+		else
+			cost = (strm->state == SLZ_ST_EOB) ? SLZ_LAST_COST_EOB : SLZ_LAST_COST;
+
+		if (bit9 >= cost || strm->debt >= SLZ_MAX_DEBT)
 			copy_lit(strm, in + pos - plit, plit, more);
 		else
 			copy_lit_huff(strm, in + pos - plit, plit, more);
@@ -771,14 +846,19 @@ int slz_rfc1951_init(struct slz_stream *strm, int level)
 	strm->ilen  = 0;
 	strm->qbits = 0;
 	strm->queue = 0;
+	strm->debt  = 0;
 	return 0;
 }
 
 /* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
  * empty literal block to byte-align the output, allowing to completely flush
  * the queue. This requires that the output buffer still has the size of the
- * queue available (up to 4 bytes), plus one byte for (BFINAL,BTYPE), plus 4
- * bytes for LEN+NLEN, or a total of 9 bytes in the worst case. The number of
+ * queue (up to 31 bits when using the 64-bit queue), plus a possible EOB (7
+ * bits), plus (BFINAL,BTYPE) (3 bits), which once rounded up to the next byte
+ * make 6 bytes, plus 4 bytes for LEN+NLEN, or a total of 10 bytes in the worst
+ * case. If the stream was already completed by a previous call to encode()
+ * with <more> cleared, the last block is simply terminated and the output
+ * aligned, since nothing may be appended to a finished stream. The number of
  * bytes emitted is returned. It is guaranteed that the queue is empty on
  * return. This may cause some overhead by adding needless 5-byte blocks if
  * called to often.
@@ -797,15 +877,26 @@ int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf)
 		send_eob(strm);
 	}
 
-	/* send BFINAL according to state, and BTYPE=00 (lit) */
-	enqueue8(strm, (strm->state == SLZ_ST_DONE) ? 1 : 0, 3);
+	if (strm->state == SLZ_ST_DONE) {
+		/* The block we've just terminated was already marked final, so
+		 * the deflate stream is complete and nothing may be appended to
+		 * it: an extra block here would be located past the end of the
+		 * stream and would shift the gzip or zlib trailer that the
+		 * caller is about to emit. Aligning the output is all we have
+		 * to do, and it's all that's left to do for finish() as well.
+		 */
+		flush_bits(strm);
+		return strm->outbuf - buf;
+	}
+
+	/* send BFINAL=0 and BTYPE=00 (lit) */
+	enqueue8(strm, 0, 3);
 	flush_bits(strm);             // emit pending bits
 	copy_32b(strm, 0xFFFF0000U);  // len=0, nlen=~0
 
-	/* Now the queue is empty, EOB was sent, BFINAL might have been sent if
-	 * we completed the last block, and a zero-byte block was sent to byte-
-	 * align the output. The last state reflects all this. Let's just
-	 * return the number of bytes added to the output buffer.
+	/* Now the queue is empty, EOB was sent, and a zero-byte block was sent
+	 * to byte-align the output. The last state reflects all this. Let's
+	 * just return the number of bytes added to the output buffer.
 	 */
 	return strm->outbuf - buf;
 }
@@ -813,9 +904,10 @@ int slz_rfc1951_flush(struct slz_stream *strm, unsigned char *buf)
 /* Flushes any pending for stream <strm> into buffer <buf>, then sends BTYPE=1
  * and BFINAL=1 if needed. The stream ends in SLZ_ST_DONE. It returns the number
  * of bytes emitted. The trailer consists in flushing the possibly pending bits
- * from the queue (up to 7 bits), then possibly EOB (7 bits), then 3 bits, EOB,
- * a rounding to the next byte, which amounts to a total of 4 bytes max, that
- * the caller must ensure are available before calling the function.
+ * from the queue (up to 31 bits when using the 64-bit queue), then possibly
+ * EOB (7 bits), then 3 bits, EOB, a rounding to the next byte, which amounts
+ * to a total of 6 bytes max, that the caller must ensure are available before
+ * calling the function.
  */
 int slz_rfc1951_finish(struct slz_stream *strm, unsigned char *buf)
 {
@@ -1142,6 +1234,7 @@ int slz_rfc1952_init(struct slz_stream *strm, int level)
 	strm->ilen   = 0;
 	strm->qbits  = 0;
 	strm->queue  = 0;
+	strm->debt   = 0;
 	return 0;
 }
 
@@ -1149,10 +1242,10 @@ int slz_rfc1952_init(struct slz_stream *strm, int level)
  * empty literal block to byte-align the output, allowing to completely flush
  * the queue. Note that if the initial header was never sent, it will be sent
  * first as well (10 extra bytes). This requires that the output buffer still
- * has this plus the size of the queue available (up to 4 bytes), plus one byte
- * for (BFINAL,BTYPE), plus 4 bytes for LEN+NLEN, or a total of 19 bytes in the
- * worst case. The number of bytes emitted is returned. It is guaranteed that
- * the queue is empty on return. This may cause some overhead by adding
+ * has this plus the 6 bytes needed to flush the queue, the possible EOB and
+ * the (BFINAL,BTYPE) bits, plus 4 bytes for LEN+NLEN, or a total of 20 bytes
+ * in the worst case. The number of bytes emitted is returned. It is guaranteed
+ * that the queue is empty on return. This may cause some overhead by adding
  * needless 5-byte blocks if called to often.
  */
 int slz_rfc1952_flush(struct slz_stream *strm, unsigned char *buf)
@@ -1169,11 +1262,12 @@ int slz_rfc1952_flush(struct slz_stream *strm, unsigned char *buf)
 /* Flushes pending bits and sends the gzip trailer for stream <strm> into
  * buffer <buf>. When it's done, the stream state is updated to SLZ_ST_END. It
  * returns the number of bytes emitted. The trailer consists in flushing the
- * possibly pending bits from the queue (up to 24 bits), rounding to the next
- * byte, then 4 bytes for the CRC and another 4 bytes for the input length.
- * That may about to 4+4+4 = 12 bytes, that the caller must ensure are
- * available before calling the function. Note that if the initial header was
- * never sent, it will be sent first as well (10 extra bytes).
+ * possibly pending bits from the queue, the possible EOB and the final empty
+ * block, rounding to the next byte, then 4 bytes for the CRC and another 4
+ * bytes for the input length. That may amount to 6+4+4 = 14 bytes, that the
+ * caller must ensure are available before calling the function. Note that if
+ * the initial header was never sent, it will be sent first as well (10 extra
+ * bytes).
  */
 int slz_rfc1952_finish(struct slz_stream *strm, unsigned char *buf)
 {
@@ -1336,8 +1430,8 @@ uint32_t slz_adler32_by1(uint32_t crc, const unsigned char *buf, int len)
  */
 uint32_t slz_adler32_block(uint32_t crc, const unsigned char *buf, long len)
 {
-	long s1 = crc & 0xffff;
-	long s2 = (crc >> 16);
+	unsigned long s1 = crc & 0xffff;
+	unsigned long s2 = (crc >> 16);
 	long blk;
 	long n;
 
@@ -1418,18 +1512,18 @@ int slz_rfc1950_init(struct slz_stream *strm, int level)
 	strm->ilen   = 0;
 	strm->qbits  = 0;
 	strm->queue  = 0;
+	strm->debt   = 0;
 	return 0;
 }
 
-/* Flushes any pending data for stream <strm> into buffer <buf>, then emits an
- * empty literal block to byte-align the output, allowing to completely flush
- * the queue. Note that if the initial header was never sent, it will be sent
- * first as well (2 extra bytes). This requires that the output buffer still
- * has this plus the size of the queue available (up to 4 bytes), plus one byte
- * for (BFINAL,BTYPE), plus 4 bytes for LEN+NLEN, or a total of 11 bytes in the
- * worst case. The number of bytes emitted is returned. It is guaranteed that
- * the queue is empty on return. This may cause some overhead by adding
- * needless 5-byte blocks if called to often.
+/* Flushes pending bits and sends the gzip trailer for stream <strm> into
+ * buffer <buf>. When it's done, the stream state is updated to SLZ_ST_END. It
+ * returns the number of bytes emitted. The trailer consists in flushing the
+ * possibly pending bits from the queue, the possible EOB and the final empty
+ * block, rounding to the next byte, then 4 bytes for the CRC. That may amount
+ * to 6+4 = 10 bytes, that the caller must ensure are available before calling
+ * the function. Note that if the initial header was never sent, it will be
+ * sent first as well (2 extra bytes).
  */
 int slz_rfc1950_flush(struct slz_stream *strm, unsigned char *buf)
 {
@@ -1445,11 +1539,11 @@ int slz_rfc1950_flush(struct slz_stream *strm, unsigned char *buf)
 /* Flushes pending bits and sends the gzip trailer for stream <strm> into
  * buffer <buf>. When it's done, the stream state is updated to SLZ_ST_END. It
  * returns the number of bytes emitted. The trailer consists in flushing the
- * possibly pending bits from the queue (up to 24 bits), rounding to the next
- * byte, then 4 bytes for the CRC. That may about to 4+4 = 8 bytes, that the
- * caller must ensure are available before calling the function. Note that if
- * the initial header was never sent, it will be sent first as well (2 extra
- * bytes).
+ * possibly pending bits from the queue, the possible EOB and the final empty
+ * block, rounding to the next byte, then 4 bytes for the CRC. That may amount
+ * to 6+4 = 10 bytes, that the caller must ensure are available before calling
+ * the function. Note that if the initial header was never sent, it will be
+ * sent first as well (2 extra bytes).
  */
 int slz_rfc1950_finish(struct slz_stream *strm, unsigned char *buf)
 {

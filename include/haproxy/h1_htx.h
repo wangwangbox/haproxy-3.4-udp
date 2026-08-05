@@ -1,4 +1,4 @@
-/*
+﻿/*
  * include/haproxy/h1_htx.h
  * This file defines function prototypes for H1 manipulation using the
  * internal representation.
@@ -27,6 +27,7 @@
 #include <haproxy/api-t.h>
 #include <haproxy/buf-t.h>
 #include <haproxy/h1.h>
+#include <haproxy/h1_htx-t.h>
 #include <haproxy/htx.h>
 
 int h1_parse_msg_hdrs(struct h1m *h1m, union h1_sl *h1sl, struct htx *dsthtx,
@@ -63,9 +64,9 @@ static inline struct ist h1_get_uri(const struct htx_sl *sl)
 
 int h1_format_htx_reqline(const struct htx_sl *sl, struct buffer *chk);
 int h1_format_htx_stline(const struct htx_sl *sl, struct buffer *chk);
-int h1_format_htx_hdr(const struct ist n, const struct ist v, struct buffer *chk);
+int h1_format_htx_hdr(const struct ist n, const struct ist v, struct buffer *chk, struct h1_hdrs_map *hdrs_map);
 int h1_format_htx_data(const struct ist data, struct buffer *chk, int chunked);
-int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf);
+int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf, struct h1_hdrs_map *hdrs_map);
 
 #endif /* _HAPROXY_H1_HTX_H */
 

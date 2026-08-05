@@ -1,4 +1,4 @@
-/*
+﻿/*
  * HTTP sample conversion
  *
  * Copyright 2000-2018 Willy Tarreau <w@1wt.eu>
@@ -263,7 +263,7 @@ static int sample_conv_url_dec(const struct arg *args, struct sample *smp, void 
 	  * before decoding.
 	 */
 	if (smp->flags & SMP_F_CONST || smp->data.u.str.size <= smp->data.u.str.data) {
-		struct buffer *str = get_trash_chunk_sz(smp->data.u.str.data + 1);
+		struct buffer *str = get_best_trash_chunk(&smp->data.u.str, smp->data.u.str.data+1);
 
 		if (!str)
 			return 0;
@@ -272,6 +272,9 @@ static int sample_conv_url_dec(const struct arg *args, struct sample *smp, void 
 		smp->data.u.str.size = str->size;
 		smp->flags &= ~SMP_F_CONST;
 	}
+
+	if (smp->data.u.str.size <= smp->data.u.str.data)
+		return 0;
 
 	/* Add final \0 required by url_decode(), and convert the input string. */
 	smp->data.u.str.area[smp->data.u.str.data] = '\0';
@@ -353,7 +356,7 @@ static int sample_conv_url_enc(const struct arg *args, struct sample *smp, void
 		return 0;
 
 	ret = encode_chunk(trash->area, trash->area + trash->size, '%',
-			   encode_map, &smp->data.u.str);
+			   encode_map, &smp->data.u.str, 0);
 	if (ret == NULL || *ret != '\0')
 		return 0;
 	trash->data = ret - trash->area;

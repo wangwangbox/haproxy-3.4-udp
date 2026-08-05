@@ -1,4 +1,4 @@
-/*
+﻿/*
  * HTTP/2 mux-demux for connections
  *
  * Copyright 2017 Willy Tarreau <w@1wt.eu>
@@ -3560,7 +3560,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		/* The stream exists/existed, this must be a trailers frame */
 		if (h2s->st != H2_SS_CLOSED) {
 			if (!h2s_rxbuf_tail(h2s) && !h2s_get_rxbuf(h2s)) {
-				TRACE_USER("Not allowed to get an extra buffer for H2 request trailers", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, );
+				TRACE_USER("Not allowed to get an extra buffer for H2 request trailers", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0);
 				h2c->flags |= H2_CF_DEM_RXBUF;
 				goto out;
 			}
@@ -3794,7 +3794,7 @@ static struct h2s *h2c_bck_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	}
 
 	if (!h2s_rxbuf_tail(h2s) && !h2s_get_rxbuf(h2s)) {
-		TRACE_USER("Not allowed to get an extra buffer for H2 response HEADERS", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, );
+		TRACE_USER("Not allowed to get an extra buffer for H2 response HEADERS", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0);
 		h2c->flags |= H2_CF_DEM_RXBUF;
 		goto fail;
 	}
@@ -7960,7 +7960,7 @@ static size_t h2_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 		goto end; // may be NULL if empty
 
 	h2s_htx = htx_from_buf(rxbuf);
-	if (htx_is_empty(h2s_htx) && !(h2s_htx->flags & HTX_FL_PARSING_ERROR)) {
+	if (htx_is_empty_noerr(h2s_htx)) {
 		/* Here htx_to_buf() will set buffer data to 0 because
 		 * the HTX is empty.
 		 */
@@ -7972,7 +7972,7 @@ static size_t h2_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 
 	/* <buf> is empty and the message is small enough, swap the
 	 * buffers. */
-	if (htx_is_empty(buf_htx) && htx_used_space(h2s_htx) <= count) {
+	if (htx_is_empty_noerr(buf_htx) && htx_used_space(h2s_htx) <= count) {
 		count -= h2s_htx->data;
 		htx_to_buf(buf_htx, buf);
 		htx_to_buf(h2s_htx, rxbuf);
@@ -8186,11 +8186,14 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 
   done:
 	if (h2s->st >= H2_SS_HLOC) {
+		struct htx_ret htxret;
+
 		/* trim any possibly pending data after we close (extra CR-LF,
 		 * unprocessed trailers, abnormal extra data, ...)
 		 */
-		total += count;
-		count = 0;
+		htxret = htx_drain(htx, count);
+		total += htxret.ret;
+		count -= htxret.ret;
 	}
 
 	/* RST are sent similarly to frame acks */

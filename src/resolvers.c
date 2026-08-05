@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Name server resolution
  *
  * Copyright 2014 Baptiste Assmann <bedis9@gmail.com>
@@ -3613,7 +3613,7 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	}
 
 	/* allocate new proxy to tcp servers */
-	p = alloc_new_proxy(id, PR_CAP_FE | PR_CAP_BE, &errmsg);
+	p = alloc_new_proxy(NULL, PR_CAP_FE | PR_CAP_BE, &errmsg);
 	if (!p) {
 		ha_free(&errmsg); // ignored
 		err_code |= ERR_ALERT | ERR_FATAL;

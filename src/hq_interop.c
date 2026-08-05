@@ -1,4 +1,4 @@
-#include <haproxy/hq_interop.h>
+﻿#include <haproxy/hq_interop.h>
 
 #include <import/ist.h>
 #include <haproxy/buf.h>
@@ -39,12 +39,22 @@ static ssize_t hq_interop_rcv_buf_req(struct qcs *qcs, struct buffer *b, int fin
 	}
 
 	if (!data || !HTTP_IS_SPHT(*ptr)) {
+		if (b_size(b) - b_room(b) >= qcm_stream_rx_bufsz()) {
+			fprintf(stderr, "content too big\n");
+			return -1;
+		}
+
 		fprintf(stderr, "truncated stream\n");
 		return 0;
 	}
 
 	ptr++;
 	if (!--data) {
+		if (b_size(b) - b_room(b) >= qcm_stream_rx_bufsz()) {
+			fprintf(stderr, "content too big\n");
+			return -1;
+		}
+
 		fprintf(stderr, "truncated stream\n");
 		return 0;
 	}
@@ -62,6 +72,11 @@ static ssize_t hq_interop_rcv_buf_req(struct qcs *qcs, struct buffer *b, int fin
 	}
 
 	if (!data) {
+		if (b_size(b) - b_room(b) >= qcm_stream_rx_bufsz()) {
+			fprintf(stderr, "content too big\n");
+			return -1;
+		}
+
 		fprintf(stderr, "truncated stream\n");
 		return 0;
 	}
@@ -105,6 +120,7 @@ static ssize_t hq_interop_rcv_buf_res(struct qcs *qcs, struct buffer *b, int fin
 	size_t to_copy = b_data(b);
 	size_t htx_sent = 0;
 	uint32_t htx_space;
+	char *head;
 
 	htx_buf = qcc_get_stream_rxbuf(qcs);
 	BUG_ON(!htx_buf);
@@ -130,21 +146,43 @@ static ssize_t hq_interop_rcv_buf_res(struct qcs *qcs, struct buffer *b, int fin
 		}
 	}
 	else {
-		BUG_ON(b_head(b) + to_copy > b_wrap(b)); /* TODO */
-
+		head = b_head(b);
+ retry:
 		htx_space = htx_free_data_space(htx);
+		if (!htx_space) {
+			qcs->flags |= QC_SF_DEM_FULL;
+			goto out;
+		}
+
 		if (to_copy > htx_space) {
 			to_copy = htx_space;
 			fin = 0;
 		}
 
+		if (head + to_copy > b_wrap(b)) {
+			size_t contig = b_wrap(b) - head;
+			htx_sent = htx_add_data(htx, ist2(b_head(b), contig));
+			if (htx_sent < contig) {
+				qcs->flags |= QC_SF_DEM_FULL;
+				goto out;
+			}
+
+			to_copy -= contig;
+			head = b_orig(b);
+			goto retry;
+		}
+
 		htx_sent = htx_add_data(htx, ist2(b_head(b), to_copy));
-		BUG_ON(htx_sent < to_copy); /* TODO */
+		if (htx_sent < to_copy) {
+			qcs->flags |= QC_SF_DEM_FULL;
+			goto out;
+		}
 
 		if (fin && to_copy == htx_sent)
 			htx->flags |= HTX_FL_EOM;
 	}
 
+ out:
 	htx_to_buf(htx, htx_buf);
 	return htx_sent;
 }
@@ -152,9 +190,6 @@ static ssize_t hq_interop_rcv_buf_res(struct qcs *qcs, struct buffer *b, int fin
 /* Returns the amount of decoded bytes from <b> or a negative error code. */
 static ssize_t hq_interop_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 {
-	/* hq-interop parser does not support buffer wrapping. */
-	BUG_ON(b_data(b) != b_contig_data(b, 0));
-
 	return !(qcs->qcc->flags & QC_CF_IS_BACK) ?
 	  hq_interop_rcv_buf_req(qcs, b, fin) :
 	  hq_interop_rcv_buf_res(qcs, b, fin);
@@ -168,6 +203,7 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 	struct htx *htx = NULL;
 	struct htx_blk *blk;
 	struct htx_sl *sl = NULL;
+	struct http_uri_parser uri_parser;
 	int32_t idx;
 	uint32_t bsize, fsize;
 	struct buffer *res = NULL;
@@ -200,7 +236,8 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 
 			/* Only GET supported for HTTP/0.9. */
 			b_putist(res, ist("GET "));
-			b_putist(res, htx_sl_req_uri(sl));
+			uri_parser = http_uri_parser_init(htx_sl_req_uri(sl));
+			b_putist(res, http_parse_path(&uri_parser));
 			b_putist(res, ist("\r\n"));
 			htx_remove_blk(htx, blk);
 			total += fsize;
@@ -260,6 +297,14 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 
 		/* only body is transferred on HTTP/0.9 */
 		case HTX_BLK_RES_SL:
+			sl = htx_get_blk_ptr(htx, blk);
+			if (!(sl->flags & HTX_SL_F_XFER_LEN))
+				qcs->flags |= QC_SF_UNKNOWN_PL_LENGTH;
+			htx_remove_blk(htx, blk);
+			total += bsize;
+			count -= bsize;
+			break;
+
 		case HTX_BLK_TLR:
 		case HTX_BLK_EOT:
 		default:
@@ -339,6 +384,10 @@ static void hq_interop_lclose(struct qcs *qcs, enum qcc_app_ops_lclose_mode mode
 		qcc_reset_stream(qcs, 0, se_tevt_type_cancelled);
 		if (!(qcs->qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL)))
 			qcc_set_error(qcs->qcc, 0, 0, muxc_tevt_type_graceful_shut);
+		break;
+
+	case QCC_APP_OPS_LCLO_MODE_READ:
+		qcc_abort_stream_read(qcs, 0);
 		break;
 	}
 }

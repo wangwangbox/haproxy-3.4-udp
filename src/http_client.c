@@ -1,4 +1,4 @@
-/*
+﻿/*
  * HTTP Client
  *
  * Copyright (C) 2021 HAProxy Technologies, William Lallemand <wlallemand@haproxy.com>
@@ -594,11 +594,11 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 					hc->ops.req_payload(hc);
 
 					hc_htx = htxbuf(&hc->req.buf);
-					if (htx_is_empty(hc_htx))
+					if (htx_is_empty_noerr(hc_htx))
 						goto out;
 
 					htx = htx_from_buf(outbuf);
-					if (htx_is_empty(htx)) {
+					if (htx_is_empty_noerr(htx)) {
 						/* Here htx_to_buf() will set buffer data to 0 because
 						 * the HTX is empty, and allow us to do an xfer.
 						 */
@@ -948,15 +948,7 @@ int httpclient_applet_init(struct appctx *appctx)
 	}
 
 	s = appctx_strm(appctx);
-	s->target = target;
-	if (objt_server(s->target)) {
-		struct server *srv = __objt_server(s->target);
-
-		if (srv->counters.shared.tg)
-			s->sv_tgcounters = __objt_server(s->target)->counters.shared.tg[tgid - 1];
-		else
-			s->sv_tgcounters = NULL;
-	}
+	stream_set_target(s, target);
 
 	/* set the "timeout server" */
 	s->scb->ioto = hc->timeout_server;

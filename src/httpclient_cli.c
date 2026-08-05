@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+﻿/* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /* "httpclient" CLI command */
 
@@ -202,7 +202,7 @@ static int hc_cli_io_handler(struct appctx *appctx)
 			chunk_reset(&trash);
 			hdrs = hc->res.hdrs;
 			for (hdr = hdrs; isttest(hdr->v); hdr++) {
-				if (!h1_format_htx_hdr(hdr->n, hdr->v, &trash))
+				if (!h1_format_htx_hdr(hdr->n, hdr->v, &trash, NULL))
 					goto too_many_hdrs;
 			}
 			if (!chunk_memcat(&trash, "\r\n", 2))

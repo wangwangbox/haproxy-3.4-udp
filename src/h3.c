@@ -1,4 +1,4 @@
-/*
+﻿/*
  * HTTP/3 protocol processing
  *
  * This library is free software; you can redistribute it and/or
@@ -274,7 +274,7 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 		 * streams that have unknown or unsupported types.
 		 */
 		TRACE_STATE("abort reading on unknown uni stream type", H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
-		qcc_abort_stream_read(qcs);
+		qcc_abort_stream_read(qcs, H3_ERR_NO_ERROR);
 		goto err;
 	}
 
@@ -1139,7 +1139,7 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	struct buffer *tmp = get_trash_chunk();
 	struct htx *htx = NULL;
 	struct htx_sl *sl;
-	struct htx_blk *tailblk = NULL;
+	uint32_t data_ofs = 0; /* used to rollback on error */
 	struct http_hdr list[global.tune.max_http_hdr * 2];
 	unsigned int flags = HTX_SL_F_NONE;
 	struct ist status = IST_NULL;
@@ -1190,7 +1190,7 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	}
 	BUG_ON(!b_size(appbuf)); /* TODO */
 	htx = htx_from_buf(appbuf);
-	tailblk = htx_get_tail_blk(htx);
+	data_ofs = htx->data;
 	/* Only handle one HEADERS frame at a time. Thus if HTX buffer is too
 	 * small, it happens solely from a single frame and the only option is
 	 * to close the stream.
@@ -1381,8 +1381,15 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 
  out:
 	if (appbuf) {
-		if ((ssize_t)len < 0)
-			htx_truncate_blk(htx, tailblk);
+		if ((ssize_t)len < 0) {
+			/* Rollback the partial conversion. Note that a pointer on
+			 * the tail block cannot be used for this because it encodes
+			 * a block position and adding blocks may compact the block
+			 * table, so rely on the amount of data that was present
+			 * before the conversion instead.
+			 */
+			htx_truncate(htx, data_ofs);
+		}
 		htx_to_buf(htx, appbuf);
 	}
 
@@ -1408,7 +1415,7 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	struct buffer *appbuf = NULL;
 	struct htx *htx = NULL;
 	struct htx_sl *sl;
-	struct htx_blk *tailblk = NULL;
+	uint32_t data_ofs = 0; /* used to rollback on error */
 	struct http_hdr list[global.tune.max_http_hdr * 2];
 	int hdr_idx, ret;
 	const char *ctl;
@@ -1439,7 +1446,7 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	}
 	BUG_ON(!b_size(appbuf)); /* TODO */
 	htx = htx_from_buf(appbuf);
-	tailblk = htx_get_tail_blk(htx);
+	data_ofs = htx->data;
 
 	if (!h3s->data_len) {
 		/* Notify that no body is present. This can only happens if
@@ -1556,8 +1563,15 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
  out:
 	/* HTX may be non NULL if error before previous htx_to_buf(). */
 	if (appbuf) {
-		if ((ssize_t)len < 0)
-			htx_truncate_blk(htx, tailblk);
+		if ((ssize_t)len < 0) {
+			/* Rollback the partial conversion. Note that a pointer on
+			 * the tail block cannot be used for this because it encodes
+			 * a block position and adding blocks may compact the block
+			 * table, so rely on the amount of data that was present
+			 * before the conversion instead.
+			 */
+			htx_truncate(htx, data_ofs);
+		}
 		htx_to_buf(htx, appbuf);
 	}
 
@@ -1824,7 +1838,7 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 
 		/* FIN received, ensure body length is conform to any content-length header. */
 		if ((h3s->flags & H3_SF_HAVE_CLEN) && h3_check_body_size(qcs, 1)) {
-			qcc_abort_stream_read(qcs);
+			qcc_abort_stream_read(qcs, h3s->err);
 			qcc_reset_stream(qcs, h3s->err, se_tevt_type_proto_err);
 			goto done;
 		}
@@ -1875,7 +1889,7 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 				}
 				else if (qcs->sd) {
 					/* content-length not present, update estimated payload length. */
-					qcs->sd->kip = h3s->data_len;
+					qcs->sd->kip += flen;
 				}
 			}
 
@@ -2049,14 +2063,14 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 		/* TODO Only unimplemented CONNECT reports H3_ERR_REQUEST_REJECTED here. */
 		const int tevt =
 		  (h3s->err == H3_ERR_REQUEST_REJECTED) ? 0 : se_tevt_type_proto_err;
-		qcc_abort_stream_read(qcs);
+		qcc_abort_stream_read(qcs, h3s->err);
 		qcc_reset_stream(qcs, h3s->err, tevt);
-		total = b_data(b);
+		total += b_data(b);
 		goto done;
 	}
 	else if (h3c->err) {
 		qcc_set_error(qcs->qcc, h3c->err, 1, muxc_tevt_type_proto_err);
-		total = b_data(b);
+		total += b_data(b);
 		goto done;
 	}
 	else if (unlikely(ret < 0)) {
@@ -3026,8 +3040,7 @@ static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count, char
 	        /* Generate a STOP_SENDING if full response transferred before
 	         * receiving the full request.
 	         */
-	        qcs->err = H3_ERR_NO_ERROR;
-	        qcc_abort_stream_read(qcs);
+	        qcc_abort_stream_read(qcs, H3_ERR_NO_ERROR);
 	}
 #endif
 
@@ -3168,6 +3181,21 @@ static void h3_lclose(struct qcs *qcs, enum qcc_app_ops_lclose_mode mode)
 {
 	TRACE_ENTER(H3_EV_H3S_END, qcs->qcc->conn, qcs);
 
+	/* RFC 9114 4.1.1. Request Cancellation and Rejection
+	 *
+	 * Servers MUST NOT use the H3_REQUEST_REJECTED error code for requests
+	 * that were partially or fully processed. When a server abandons a
+	 * response after partial processing, it SHOULD abort its response
+	 * stream with the error code H3_REQUEST_CANCELLED.
+	 * Client SHOULD use the error code H3_REQUEST_CANCELLED to cancel requests.
+	 */
+
+	/* Following the above recommendations, H3_REQUEST_REJECTED is never
+	 * used in practice in haproxy as a server on shut as upper stream
+	 * layer is instantiated immediately with HEADERS content attached. The
+	 * only exception is for stream closure after GOAWAY emission.
+	 */
+
 	switch (mode) {
 	case QCC_APP_OPS_LCLO_MODE_NORMAL:
 		/* Close stream with FIN. This can only be performed if at
@@ -3193,6 +3221,11 @@ static void h3_lclose(struct qcs *qcs, enum qcc_app_ops_lclose_mode mode)
 			qcc_set_error(qcs->qcc, H3_ERR_EXCESSIVE_LOAD, 1,
 			              muxc_tevt_type_graceful_shut);
 		}
+		break;
+
+	case QCC_APP_OPS_LCLO_MODE_READ:
+		TRACE_STATE("request stream read channel closure", H3_EV_H3S_END, qcs->qcc->conn, qcs);
+		qcc_abort_stream_read(qcs, H3_ERR_REQUEST_CANCELLED);
 		break;
 	}
 
@@ -3253,7 +3286,7 @@ static int h3_attach(struct qcs *qcs, void *conn_ctx)
 		BUG_ON(quic_stream_is_local(qcs->qcc, qcs->id));
 
 		TRACE_STATE("close stream outside of GOAWAY range", H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
-		qcc_abort_stream_read(qcs);
+		qcc_abort_stream_read(qcs, H3_ERR_REQUEST_REJECTED);
 		qcc_reset_stream(qcs, H3_ERR_REQUEST_REJECTED, 0);
 	}
 

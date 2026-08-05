@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Peer synchro management.
  *
  * Copyright 2010 EXCELIANCE, Emeric Brun <ebrun@exceliance.fr>
@@ -883,6 +883,11 @@ int peer_prepare_updatemsg(char *msg, size_t size, struct peer_prep_params *p)
 						/* Encode the length of the dictionary entry data */
 						value_len = de->len;
 						intencode(value_len, &end);
+						/* Make sure the value fits in the buffer */
+						if ((size_t)(end - msg) + value_len > size) {
+							HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
+							return 0;
+						}
 						/* Copy the data */
 						memcpy(end, de->value.key, value_len);
 						end += value_len;

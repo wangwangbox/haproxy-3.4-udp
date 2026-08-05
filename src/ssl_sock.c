@@ -1,4 +1,4 @@
-
+﻿
 /*
  * SSL/TLS transport layer over SOCK_STREAM sockets
  *
@@ -138,6 +138,7 @@ struct global_ssl global_ssl = {
 	.default_dh_param = SSL_DEFAULT_DH_PARAM,
 	.ctx_cache = DEFAULT_SSL_CTX_CACHE,
 	.capture_buffer_size = 0,
+	.keyupdate_max = 100, /* max received TLS1.3 KeyUpdates/s per conn; 0 to disable */
 	.extra_files = SSL_GF_ALL,
 	.extra_files_noext = 0,
 #ifdef HAVE_SSL_KEYLOG
@@ -284,10 +285,24 @@ static int ssl_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe
 static int ssl_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count)
 {
 	struct ssl_sock_ctx *ctx = xprt_ctx;
+	int ret;
 
 	if (!(ctx->flags & SSL_SOCK_F_KTLS_SEND))
 		return -1;
-	return ctx->xprt->rcv_pipe(conn, ctx->xprt_ctx, pipe, count);
+
+	ret = ctx->xprt->rcv_pipe(conn, ctx->xprt_ctx, pipe, count);
+
+	/*
+	 * Splicing failed, so we probably received a TLS record that is
+	 * not application data.
+	 * Just add SSL_SOCK_F_KTLS_RX_CTRL so that next time rcv_buf
+	 * will be called, and it will be taken care of.
+	 */
+	if (ret == 0 && fd_recv_ready(conn->handle.fd) &&
+	    !(conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH)))
+		ctx->flags |= SSL_SOCK_F_KTLS_RX_CTRL;
+
+	return ret;
 }
 #endif /* USE_LINUX_SPLICE && HA_USE_KTLS */
 
@@ -369,17 +384,27 @@ static int ha_ssl_read(BIO *h, char *buf, int size)
 	size_t *msg_controllenp = NULL;
 	int detect_shutr;
 	int ret;
+	int flags;
 
 	ctx = BIO_get_data(h);
+
+	/* A KeyUpdate flood was detected, we should abort now, as we may
+	 * have plenty more KeyUpdate to deal with, and that would end up
+	 * triggering the watchdog.
+	 */
+	if (ctx->flags & SSL_SOCK_F_KILL) {
+		ctx->conn->flags |= CO_FL_ERROR;
+		return -1;
+	}
 #ifdef HA_USE_KTLS
 #ifdef HAVE_VANILLA_OPENSSL
 	if (ctx->flags & SSL_SOCK_F_KTLS_RECV) {
-		if (ctx->conn->flags & CO_FL_WANT_SPLICING) {
+		if ((ctx->conn->flags & CO_FL_WANT_SPLICING) &&
+		    !(ctx->flags & SSL_SOCK_F_KTLS_RX_CTRL)) {
 			/*
-			 * We want to use splicing at this point, so
-			 * pretend we had nothing to read with the hope
-			 * OpenSSL will empty its buffers, and we can
-			 * finally start splicing
+			 * We want to use splicing at this point, so pretend we
+			 * had nothing to read with the hope OpenSSL will empty
+			 * its buffers, and we can finally start splicing.
 			 */
 			BIO_set_retry_read(h);
 			return -1;
@@ -406,7 +431,16 @@ static int ha_ssl_read(BIO *h, char *buf, int size)
 	else
 		detect_shutr = 0;
 
-	ret = ctx->xprt->rcv_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, size, msg_control, msg_controllenp, detect_shutr ? CO_RFL_TRY_HARDER : 0);
+	flags = detect_shutr ? CO_RFL_TRY_HARDER : 0;
+	/*
+	 * When reading a kTLS record, we want to read only one record,
+	 * as we only receive one msg_control from rcv_buf, while we'd need
+	 * one per record.
+	 */
+	if (msg_control)
+		flags |= CO_RFL_READ_ONCE;
+	ret = ctx->xprt->rcv_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, size, msg_control, msg_controllenp, flags);
+
 	if (detect_shutr && ctx->conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH)) {
 		ret = -1;
 	}
@@ -844,6 +878,10 @@ static void ssl_init_keylog(int write_p, int version,
                             SSL *ssl);
 #endif
 
+static void ssl_sock_keyupdate_ratelimit(int write_p, int version,
+                                          int content_type, const void *buf,
+                                          size_t len, SSL *ssl);
+
 /* List head of all registered SSL/TLS protocol message callbacks. */
 struct list ssl_sock_msg_callbacks = LIST_HEAD_INIT(ssl_sock_msg_callbacks);
 
@@ -889,6 +927,10 @@ static int ssl_sock_register_msg_callbacks(void)
 			return ERR_ABORT;
 	}
 #endif
+	if (global_ssl.keyupdate_max) {
+		if (!ssl_sock_register_msg_callback(ssl_sock_keyupdate_ratelimit))
+			return ERR_ABORT;
+	}
 #ifdef USE_QUIC_OPENSSL_COMPAT
 	if (!ssl_sock_register_msg_callback(quic_tls_compat_msg_callback))
 		return ERR_ABORT;
@@ -2188,6 +2230,49 @@ static void ssl_init_keylog(int write_p, int version,
 	}
 }
 #endif
+
+static void ssl_sock_keyupdate_ratelimit(int write_p, int version,
+                                         int content_type, const void *buf,
+                                         size_t len, SSL *ssl)
+{
+	struct ssl_sock_ctx *ctx = NULL;
+	struct connection *conn;
+	uint rate, elapsed;
+
+	/* only count KeyUpdate messages received from the peer */
+	if (write_p || content_type != SSL3_RT_HANDSHAKE)
+		return;
+	if (len < 1 || ((const unsigned char *)buf)[0] != 24 /* SSL3_MT_KEY_UPDATE */)
+		return;
+
+	conn = ssl_sock_get_conn(ssl, &ctx);
+	if (!conn || !ctx)
+		return;
+
+	rate = global_ssl.keyupdate_max;
+	elapsed = now_ms - ctx->keyupdate_last_ms;  /* wrap-safe */
+	if (elapsed) {
+		uint refill = (uint)((ullong)elapsed * rate / 1000);
+
+		if (refill) {
+			ctx->keyupdate_tokens += refill;
+			if (ctx->keyupdate_tokens > rate)
+				ctx->keyupdate_tokens = rate;
+			ctx->keyupdate_last_ms = now_ms;
+		}
+	}
+
+	if (ctx->keyupdate_tokens)
+		ctx->keyupdate_tokens--;
+	else {
+		/* received way too many KeyUpdates, kill the connection */
+		if (conn->owner)
+			session_add_glitch_ctr(conn->owner, 1);
+		ctx->flags |= SSL_SOCK_F_KILL;
+		conn->flags |= CO_FL_ERROR;
+		conn->err_code = CO_ER_SSL_KEYUPDATE;
+	}
+}
 
 /* Callback is called for ssl protocol analyse */
 static __maybe_unused void ssl_sock_msgcbk(int write_p, int version, int content_type, const void *buf, size_t len, SSL *ssl, void *arg)
@@ -5031,9 +5116,17 @@ int ssl_sock_prepare_srv_ctx(struct server *srv)
 		}
 	}
 
-	/* The QUIC server xprt has already been set. */
-	if (srv->use_ssl == 1 && !srv_is_quic(srv))
-		srv->xprt = &ssl_sock;
+	if (srv->use_ssl == 1) {
+#ifdef USE_QUIC
+		if (srv_is_quic(srv)) {
+			mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
+			srv->xprt = xprt_get(XPRT_QUIC);
+			quic_transport_params_init(&srv->quic_params, 0);
+		}
+		else
+#endif
+			srv->xprt = &ssl_sock;
+	}
 
 	if (srv->ssl_ctx.client_crt) {
 		const int create_if_none = srv->flags & SRV_F_DYNAMIC ? 0 : 1;
@@ -5844,6 +5937,8 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	ctx->xprt_ctx = NULL;
 	ctx->error_code = 0;
 	ctx->flags = SSL_SOCK_F_EARLY_ENABLED;
+	ctx->keyupdate_tokens = global_ssl.keyupdate_max;
+	ctx->keyupdate_last_ms = now_ms;
 #ifdef HA_USE_KTLS
 	ctx->record_type = 0;
 #endif
@@ -7256,6 +7351,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 		}
 	}
  leave:
+	ctx->flags &= ~SSL_SOCK_F_KTLS_RX_CTRL;
 	TRACE_LEAVE(SSL_EV_CONN_RECV, conn);
 	return done;
 
@@ -8279,7 +8375,16 @@ static int ssl_sock_get_capability(struct connection *conn, void *xprt_ctx, enum
 			ret = arg;
 			if ((ctx->flags & (SSL_SOCK_F_KTLS_RECV | SSL_SOCK_F_KTLS_SEND)) ==
 			                  (SSL_SOCK_F_KTLS_RECV | SSL_SOCK_F_KTLS_SEND)) {
-#ifdef USE_VANILLA_OPENSSL
+				/*
+				 * If we tried to splice and received
+				 * a non-application data record, don't try
+				 * to splice again, we have to go the regular
+				 * route for that record.
+				 */
+				if (ctx->flags & SSL_SOCK_F_KTLS_RX_CTRL)
+					*ret = XPRT_CONN_COULD_SPLICE;
+				else
+#ifdef HAVE_VANILLA_OPENSSL
 				/*
 				 * We can splice yet if there's still
 				 * data in OpenSSL internal buffers

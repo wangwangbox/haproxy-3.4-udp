@@ -1,4 +1,4 @@
-/*
+﻿/*
  * include/haproxy/compiler.h
  * This files contains some compiler-specific settings.
  *
@@ -590,5 +590,16 @@
 #    define __nonstring
 #  endif
 #endif
+
+/* Eats all arguments ignoring their types and contents. This is useful
+ * to avoid "foo declared but not used" warnings. A first non-empty arg
+ * is required by the function, but it's inserted by the macro.
+ */
+#define __eat_all_args(...) ___eat_all_args(0, __VA_ARGS__)
+static inline __attribute__((always_inline)) void ___eat_all_args(int ignore, ...)
+{
+	(void)ignore;
+}
+
 
 #endif /* _HAPROXY_COMPILER_H */

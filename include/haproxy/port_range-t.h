@@ -1,4 +1,4 @@
-/*
+﻿/*
  * include/haproxy/port_range-t.h
  * This file defines the prt_range type
  *
@@ -27,6 +27,7 @@
 
 struct port_range {
 	int size, get, put_h, put_t;	/* range size, and get/put positions */
+	int refcount;
 	uint16_t ports[VAR_ARRAY];	/* array of <size> ports, in host byte order */
 };
 

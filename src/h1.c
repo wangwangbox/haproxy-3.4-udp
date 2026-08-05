@@ -1,4 +1,4 @@
-/*
+﻿/*
  * HTTP/1 protocol analyzer
  *
  * Copyright 2000-2017 Willy Tarreau <w@1wt.eu>
@@ -1176,7 +1176,7 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 								goto http_msg_invalid;
 							}
 							if (h1m->err_pos == -1) /* capture the error pointer */
-								h1m->err_pos = v.ptr - start + skip; /* >= 0 now */
+								h1m->err_pos = host.ptr - start + skip; /* >= 0 now */
 						}
 					}
 				}

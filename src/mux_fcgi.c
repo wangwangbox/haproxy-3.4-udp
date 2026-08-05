@@ -1,4 +1,4 @@
-/*
+﻿/*
  * FastCGI mux-demux for connections
  *
  * Copyright (C) 2019 HAProxy Technologies, Christopher Faulet <cfaulet@haproxy.com>
@@ -4242,11 +4242,14 @@ static size_t fcgi_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, 
 
   done:
 	if (fstrm->state >= FCGI_SS_HLOC) {
+		struct htx_ret htxret;
+
 		/* trim any possibly pending data after we close (extra CR-LF,
 		 * unprocessed trailers, abnormal extra data, ...)
 		 */
-		total += count;
-		count = 0;
+		htxret = htx_drain(htx, count);
+		total += htxret.ret;
+		count -= htxret.ret;
 	}
 
 	if (fstrm->state == FCGI_SS_ERROR) {

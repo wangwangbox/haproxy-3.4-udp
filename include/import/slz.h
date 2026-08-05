@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2013-2015 Willy Tarreau <w@1wt.eu>
  *
  * Permission is hereby granted, free of charge, to any person obtaining
@@ -80,7 +80,10 @@ struct slz_stream {
 	uint16_t state; /* one of slz_state */
 	uint8_t level:1; /* 0 = no compression, 1 = compression */
 	uint8_t format:2; /* SLZ_FMT_* */
-	uint8_t unused1; /* unused for now */
+	uint8_t debt;    /* number of bits by which the fixed huffman encoding is
+	                  * currently behind the equivalent stored blocks, see
+	                  * SLZ_MAX_DEBT in slz.c
+	                  */
 	uint32_t crc32;
 	uint32_t ilen;
 };
@@ -154,12 +157,12 @@ static inline long slz_encode(struct slz_stream *strm, void *out,
 /* Flushes pending bits and sends the trailer for stream <strm> into buffer
  * <buf> if needed. When it's done, the stream state is updated to SLZ_ST_END.
  * It returns the number of bytes emitted. The trailer consists in flushing the
- * possibly pending bits from the queue (up to 24 bits), rounding to the next
- * byte, then 4 bytes for the CRC when doing zlib/gzip, then another 4 bytes
- * for the input length for gzip. That may about to 4+4+4 = 12 bytes, that the
- * caller must ensure are available before calling the function. Note that if
- * the initial header was never sent, it will be sent first as well (up to 10
- * extra bytes).
+ * possibly pending bits from the queue, the possible EOB and the final empty
+ * block, rounding to the next byte, then 4 bytes for the CRC when doing
+ * zlib/gzip, then another 4 bytes for the input length for gzip. That may
+ * amount to 6+4+4 = 14 bytes, that the caller must ensure are available before
+ * calling the function. Note that if the initial header was never sent, it
+ * will be sent first as well (up to 10 extra bytes).
  */
 static inline int slz_finish(struct slz_stream *strm, void *buf)
 {
@@ -179,8 +182,8 @@ static inline int slz_finish(struct slz_stream *strm, void *buf)
  * empty literal block to byte-align the output, allowing to completely flush
  * the queue. Note that if the initial header was never sent, it will be sent
  * first as well (0, 2 or 10 extra bytes). This requires that the output buffer
- * still has this plus the size of the queue available (up to 4 bytes), plus
- * one byte for (BFINAL,BTYPE), plus 4 bytes for LEN+NLEN, or a total of 19
+ * still has this plus the 6 bytes needed to flush the queue, the possible EOB
+ * and the (BFINAL,BTYPE) bits, plus 4 bytes for LEN+NLEN, or a total of 20
  * bytes in the worst case. The number of bytes emitted is returned. It is
  * guaranteed that the queue is empty on return. This may cause some overhead
  * by adding needless 5-byte blocks if called to often.

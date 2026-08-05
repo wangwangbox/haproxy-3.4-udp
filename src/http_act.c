@@ -1,4 +1,4 @@
-/*
+﻿/*
  * HTTP actions
  *
  * Copyright 2000-2018 Willy Tarreau <w@1wt.eu>
@@ -635,6 +635,7 @@ static enum act_parse_ret parse_replace_uri(const char **args, int *orig_arg, st
 		cap |= SMP_VAL_BE_HRQ_HDR;
 	if (!parse_logformat_string(args[cur_arg + 1], px, &rule->arg.http.fmt, LOG_OPT_HTTP, cap, err)) {
 		regex_free(rule->arg.http.re);
+		rule->arg.http.re = NULL; /* release_http_action() would free it again */
 		return ACT_RET_PRS_ERR;
 	}
 
@@ -993,7 +994,7 @@ static enum act_parse_ret parse_http_req_capture(const char **args, int *orig_ar
 		}
 
 		id = strtol(args[cur_arg], &error, 10);
-		if (*error != '\0') {
+		if (*error != '\0' || id < 0) {
 			memprintf(err, "cannot parse id '%s'", args[cur_arg]);
 			release_sample_expr(expr);
 			return ACT_RET_PRS_ERR;
@@ -1140,7 +1141,7 @@ static enum act_parse_ret parse_http_res_capture(const char **args, int *orig_ar
 	}
 
 	id = strtol(args[cur_arg], &error, 10);
-	if (*error != '\0') {
+	if (*error != '\0' || id < 0) {
 		memprintf(err, "cannot parse id '%s'", args[cur_arg]);
 		release_sample_expr(expr);
 		return ACT_RET_PRS_ERR;
@@ -1404,6 +1405,11 @@ static enum act_return http_action_early_hint(struct act_rule *rule, struct prox
 	}
 
   leave:
+	/* the buffer was marked as full by htx_from_buf() above, it must be
+	 * updated back, especially on the HTTP/1.0 path where the HTX message
+	 * was left untouched and empty.
+	 */
+	htx_to_buf(htx, &res->buf);
 	free_trash_chunk(value);
 	return ret;
 
@@ -1819,6 +1825,7 @@ static enum act_parse_ret parse_http_replace_header(const char **args, int *orig
 	if (!parse_logformat_string(args[cur_arg], px, &rule->arg.http.fmt, LOG_OPT_HTTP, cap, err)) {
 		istfree(&rule->arg.http.str);
 		regex_free(rule->arg.http.re);
+		rule->arg.http.re = NULL; /* release_http_action() would free it again */
 		return ACT_RET_PRS_ERR;
 	}
 
@@ -1936,6 +1943,7 @@ static enum act_return http_action_del_headers_bin(struct act_rule *rule, struct
 	struct http_msg *msg = ((rule->from == ACT_F_HTTP_REQ) ? &s->txn.http->req : &s->txn.http->rsp);
 	struct htx *htx = htxbuf(&msg->chn->buf);
 	struct sample *hdrs_bin;
+	struct buffer *copy = NULL;
 	char *p, *end;
 	enum act_return ret = ACT_RET_CONT;
 	struct ist n;
@@ -1945,8 +1953,19 @@ static enum act_return http_action_del_headers_bin(struct act_rule *rule, struct
 	if (!hdrs_bin)
 		return ACT_RET_CONT;
 
-	p = b_orig(&hdrs_bin->data.u.str);
-	end = b_tail(&hdrs_bin->data.u.str);
+	/* The sample may point into the very HTX message we're about to modify
+	 * (e.g. a header value), and http_remove_header() moves its payload
+	 * around, which would leave our p/end/n pointers dangling. Work on a
+	 * private copy to stay safe.
+	 */
+	copy = alloc_trash_chunk();
+	if (!copy || b_data(&hdrs_bin->data.u.str) > b_size(copy))
+		goto fail_rewrite;
+	memcpy(b_orig(copy), b_orig(&hdrs_bin->data.u.str), b_data(&hdrs_bin->data.u.str));
+	b_set_data(copy, b_data(&hdrs_bin->data.u.str));
+
+	p = b_orig(copy);
+	end = b_tail(copy);
 	while (p < end) {
 		if (decode_varint(&p, end, &sz) == -1)
 			goto fail_rewrite;
@@ -1989,6 +2008,7 @@ static enum act_return http_action_del_headers_bin(struct act_rule *rule, struct
 	ret = ACT_RET_ERR;
 
   leave:
+	free_trash_chunk(copy);
 	return ret;
 
   fail_rewrite:
@@ -2370,9 +2390,11 @@ static enum act_parse_ret parse_http_set_map(const char **args, int *orig_arg, s
 			cap |= SMP_VAL_BE_HRS_HDR;
 	}
 
-	/* key pattern */
+	/* key pattern. Note that <arg.map.ref> must be reset once released,
+	 * otherwise release_http_map() would free it a second time.
+	 */
 	if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.key, LOG_OPT_NONE, cap, err)) {
-		free(rule->arg.map.ref);
+		ha_free(&rule->arg.map.ref);
 		return ACT_RET_PRS_ERR;
 	}
 
@@ -2380,7 +2402,7 @@ static enum act_parse_ret parse_http_set_map(const char **args, int *orig_arg, s
 		/* value pattern for set-map only */
 		cur_arg++;
 		if (!parse_logformat_string(args[cur_arg], px, &rule->arg.map.value, LOG_OPT_NONE, cap, err)) {
-			free(rule->arg.map.ref);
+			ha_free(&rule->arg.map.ref);
 			return ACT_RET_PRS_ERR;
 		}
 	}

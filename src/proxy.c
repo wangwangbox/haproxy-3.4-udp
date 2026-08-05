@@ -82,6 +82,12 @@ unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then
 
 unsigned int dynpx_next_id = 0; /* lowest ID assigned to dynamic proxies */
 
+/* CLI context used during "show backend" */
+struct show_be_ctx {
+	struct proxy *px;
+	struct watcher px_watch; /* watcher to automatically update px pointer on backend deletion */
+};
+
 /* CLI context used during "show servers {state|conn}" */
 struct show_srv_ctx {
 	struct proxy *px;       /* current proxy to dump or NULL */
@@ -92,6 +98,9 @@ struct show_srv_ctx {
 		SHOW_SRV_HEAD = 0,
 		SHOW_SRV_LIST,
 	} state;
+
+	struct watcher px_watch;  /* watcher to automatically update px on backend deletion */
+	struct watcher srv_watch; /* watcher to automatically update sv on server deletion */
 };
 
 /* proxy->options */
@@ -4472,6 +4481,9 @@ static int cli_parse_show_servers(char **args, char *payload, struct appctx *app
 
 	ctx->show_conn = *args[2] == 'c'; // "conn" vs "state"
 
+	watcher_init(&ctx->px_watch,  &ctx->px, offsetof(struct proxy,  watcher_list));
+	watcher_init(&ctx->srv_watch, &ctx->sv, offsetof(struct server, watcher_list));
+
 	/* check if a backend name has been provided */
 	if (*args[3]) {
 		/* read server state from local file */
@@ -4480,7 +4492,7 @@ static int cli_parse_show_servers(char **args, char *payload, struct appctx *app
 		if (!px)
 			return cli_err(appctx, "Can't find backend.\n");
 
-		ctx->px = px;
+		watcher_attach(&ctx->px_watch, px);
 		ctx->only_pxid = px->uuid;
 	}
 	return 0;
@@ -4522,9 +4534,9 @@ static int dump_servers_state(struct appctx *appctx)
 	char *srvrecord;
 
 	if (!ctx->sv)
-		ctx->sv = px->srv;
+		watcher_attach(&ctx->srv_watch, px->srv);
 
-	for (; ctx->sv != NULL; ctx->sv = srv->next) {
+	for (; ctx->sv; watcher_next(&ctx->srv_watch, ctx->sv->next)) {
 		srv = ctx->sv;
 
 		dump_server_addr(&srv->addr, srv_addr);
@@ -4611,10 +4623,10 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 		ctx->state = SHOW_SRV_LIST;
 
 		if (!ctx->px)
-			ctx->px = proxies_list;
+			watcher_attach(&ctx->px_watch, proxies_list);
 	}
 
-	for (; ctx->px != NULL; ctx->px = curproxy->next) {
+	for (; ctx->px; watcher_next(&ctx->px_watch, ctx->px->next)) {
 		curproxy = ctx->px;
 		/* servers are only in backends */
 		if ((curproxy->cap & PR_CAP_BE) && !(curproxy->cap & PR_CAP_INT)) {
@@ -4622,8 +4634,10 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 				return 0;
 		}
 		/* only the selected proxy is dumped */
-		if (ctx->only_pxid)
+		if (ctx->only_pxid) {
+			watcher_detach(&ctx->px_watch);
 			break;
+		}
 	}
 
 	return 1;
@@ -4634,20 +4648,23 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
  */
 static int cli_io_handler_show_backend(struct appctx *appctx)
 {
+	struct show_be_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
 
-	if (!appctx->svcctx) {
+	if (!ctx->px) {
 		chunk_printf(&trash, "# name\n");
 		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
 
-		appctx->svcctx = proxies_list;
+		watcher_init(&ctx->px_watch, &ctx->px, offsetof(struct proxy, watcher_list));
+		/* This will automatically update ctx->px pointer. */
+		watcher_attach(&ctx->px_watch, proxies_list);
 	}
 
-	for (; appctx->svcctx != NULL; appctx->svcctx = curproxy->next) {
-		curproxy = appctx->svcctx;
+	for (; ctx->px; watcher_next(&ctx->px_watch, ctx->px->next)) {
+		curproxy = ctx->px;
 
 		/* looking for non-internal backends only */
 		if ((curproxy->cap & (PR_CAP_BE|PR_CAP_INT)) != PR_CAP_BE)
@@ -5277,6 +5294,8 @@ struct show_errors_ctx {
 	int iid;		/* if >= 0, ID of the proxy to filter on */
 	int ptr;		/* <0: headers, >=0 : text pointer to restart from */
 	int bol;		/* pointer to beginning of current line */
+
+	struct watcher px_watch; /* watcher to automatically update px pointer on backend deletion */
 };
 
 /* "show errors" handler for the CLI. Returns 0 if wants to continue, 1 to stop
@@ -5309,7 +5328,10 @@ static int cli_parse_show_errors(char **args, char *payload, struct appctx *appc
 		ctx->flag |= 4; // ignore response
 	else if (strcmp(args[3], "response") == 0)
 		ctx->flag |= 2; // ignore request
+
 	ctx->px = NULL;
+	watcher_init(&ctx->px_watch, &ctx->px, offsetof(struct proxy, watcher_list));
+
 	return 0;
 }
 
@@ -5339,7 +5361,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 		if (applet_putchk(appctx, &trash) == -1)
 			goto cant_send;
 
-		ctx->px = proxies_list;
+		watcher_attach(&ctx->px_watch, proxies_list);
 		ctx->bol = 0;
 		ctx->ptr = -1;
 	}
@@ -5467,7 +5489,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 		ctx->ptr = -1;
 		ctx->flag ^= 1;
 		if (!(ctx->flag & 1))
-			ctx->px = ctx->px->next;
+			watcher_next(&ctx->px_watch, ctx->px->next);
 	}
 
 	/* dump complete */

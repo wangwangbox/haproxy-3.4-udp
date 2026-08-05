@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Functions to manipulate H1 messages using the internal representation.
  *
  * Copyright (C) 2019 HAProxy Technologies, Christopher Faulet <cfaulet@haproxy.com>
@@ -1110,14 +1110,26 @@ int h1_format_htx_stline(const struct htx_sl *sl, struct buffer *chk)
  * returns 0.
  * <chk> buffer must not wrap.
  */
-int h1_format_htx_hdr(const struct ist n, const struct ist v, struct buffer *chk)
+int h1_format_htx_hdr(const struct ist n, const struct ist v, struct buffer *chk,
+		      struct h1_hdrs_map *hdrs_map)
 {
+	struct ebpt_node *node;
+	struct h1_hdr_entry *entry;
+	struct ist name = n;
 	size_t sz = chk->data;
 
 	if (n.len + v.len + 4 > b_room(chk))
 		return 0;
 
-	if (!chunk_memcat(chk, n.ptr, n.len) ||
+	if (hdrs_map && !eb_is_empty(&hdrs_map->map)) {
+		node = ebis_lookup_len(&hdrs_map->map, istptr(n), istlen(n));
+		if (node) {
+			entry = container_of(node, struct h1_hdr_entry, node);
+			name = entry->name;
+		}
+	}
+
+	if (!chunk_memcat(chk, name.ptr, name.len) ||
 	    !chunk_memcat(chk, ": ", 2) ||
 	    !chunk_memcat(chk, v.ptr, v.len) ||
 	    !chunk_memcat(chk, "\r\n", 2))
@@ -1174,7 +1186,7 @@ int h1_format_htx_data(const struct ist data, struct buffer *chk, int chunked)
  * 0 if <outbuf> is full or not empty. No check is performed on the message, it must be
  * valid. Trailers are silently ignored if the message is not chunked.
  */
-int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf)
+int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf, struct h1_hdrs_map *hdrs_map)
 {
 	const struct htx_sl *sl;
         const struct htx_blk *blk;
@@ -1204,7 +1216,7 @@ int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf)
 			n = htx_get_blk_name(htx, blk);
 			v = htx_get_blk_value(htx, blk);
 
-			if (!h1_format_htx_hdr(n, v, outbuf))
+			if (!h1_format_htx_hdr(n, v, outbuf, hdrs_map))
 				goto full;
 		}
 		else if (type == HTX_BLK_EOH) {
@@ -1223,7 +1235,7 @@ int h1_format_htx_msg(const struct htx *htx, struct buffer *outbuf)
 			n = htx_get_blk_name(htx, blk);
 			v = htx_get_blk_value(htx, blk);
 
-			if (!h1_format_htx_hdr(n, v, outbuf))
+			if (!h1_format_htx_hdr(n, v, outbuf, hdrs_map))
 				goto full;
 		}
 		else if (type == HTX_BLK_EOT)
