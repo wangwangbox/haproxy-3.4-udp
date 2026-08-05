@@ -155,36 +155,6 @@ static int udp_addr_match(const struct sockaddr_storage *a,
 	return ipcmp(a, b, 1) == 0;
 }
 
-static int udp_addr_is_any(const struct sockaddr_storage *addr)
-{
-	if (addr->ss_family == AF_INET)
-		return ((const struct sockaddr_in *)addr)->sin_addr.s_addr == INADDR_ANY;
-	if (addr->ss_family == AF_INET6)
-		return IN6_IS_ADDR_UNSPECIFIED(&((const struct sockaddr_in6 *)addr)->sin6_addr);
-	return 0;
-}
-
-static int udp_proxy_would_loop(const struct udp_proxy_session *sess,
-				const struct sockaddr_storage *server_addr,
-				uint16_t server_port)
-{
-	const struct receiver *rx = &sess->listener->rx;
-
-	if (get_host_port(&rx->addr) != server_port)
-		return 0;
-
-	if (rx->addr.ss_family != server_addr->ss_family)
-		return 0;
-
-	if (ipcmp(&rx->addr, server_addr, 0) == 0)
-		return 1;
-
-	if (!udp_addr_is_any(&rx->addr))
-		return 0;
-
-	return addr_is_local(rx->settings->netns, server_addr) == 1;
-}
-
 static void udp_proxy_eval_resolve_rules(struct proxy *px, struct session *sess,
                                          struct stream *strm)
 {
@@ -472,8 +442,6 @@ static int udp_proxy_connect_session(struct udp_proxy_session *sess)
 	HA_SPIN_UNLOCK(SERVER_LOCK, &sess->srv->lock);
 
 	if (addr.ss_family == AF_UNSPEC)
-		return 0;
-	if (udp_proxy_would_loop(sess, &addr, port))
 		return 0;
 
 	fd = socket(addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
