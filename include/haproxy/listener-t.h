@@ -245,6 +245,7 @@ struct listener {
 	uint16_t flags;                 /* listener flags: LI_F_* */
 	int luid;			/* listener universally unique ID, used for SNMP, indexed by <luid_node> below */
 	int nbconn;			/* current number of connections on this listener */
+	int udp_nbsess;			/* mode udp: current number of UDP sessions (not in nbconn, see udp_proxy.c) */
 	unsigned long thr_idx;          /* thread indexes for queue distribution (see listener_accept()) */
 	__decl_thread(HA_RWLOCK_T lock);
 

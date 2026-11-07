@@ -66,28 +66,79 @@
 #include <haproxy/trace.h>
 #include <haproxy/vars.h>
 
-static int udp_check_connect(struct check *check)
+/* Closes the UDP probe socket left by a previous "mode udp" check, if any. */
+static void udp_check_close(struct check *check)
+{
+	if (check->udp_fd > 0) {
+		close(check->udp_fd - 1);
+		check->udp_fd = 0;
+	}
+}
+
+/* Health check for "mode udp" servers. A connected UDP socket only learns that
+ * the target is unreachable (closed port, unreachable host...) when an ICMP
+ * error comes back after a datagram was sent, which happens asynchronously.
+ * So each run first collects the outcome of the empty probe datagram sent by
+ * the previous run (a pending socket error means a failure), then sends a new
+ * probe which will be evaluated by the next run. The check's "addr" and "port"
+ * settings are honored. Returns 1 if the server looks reachable, 0 otherwise.
+ */
+static int udp_check_run(struct check *check)
 {
 	struct server *srv = check->server;
 	struct sockaddr_storage addr;
-	int fd;
+	socklen_t len;
+	int fd, err, ok = 1;
+	int port;
 
-	if (!srv || srv->addr.ss_family == AF_UNSPEC)
+	if (check->udp_fd > 0) {
+		err = 0;
+		len = sizeof(err);
+		if (getsockopt(check->udp_fd - 1, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err)
+			ok = 0;
+		udp_check_close(check);
+	}
+
+	if (!srv)
 		return 0;
 
-	fd = socket(srv->addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+	if (is_addr(&check->addr))
+		addr = check->addr;
+	else {
+		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
+		addr = srv->addr;
+		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
+	}
+
+	if (addr.ss_family != AF_INET && addr.ss_family != AF_INET6)
+		return 0;
+
+	/* a server with a port offset/map needs an explicit check port */
+	port = check->port;
+	if (!port && !(srv->flags & SRV_F_MAPPORTS))
+		port = srv->svc_port;
+	if (!port)
+		return 0;
+	set_host_port(&addr, port);
+
+	fd = socket(addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
 	if (fd == -1)
 		return 0;
 
-	addr = srv->addr;
-	set_host_port(&addr, srv->svc_port);
-	if (connect(fd, (struct sockaddr *)&addr, get_addr_len(&addr)) == -1) {
+	if (fd_set_nonblock(fd) == -1 || fd_set_cloexec(fd) == -1 ||
+	    connect(fd, (struct sockaddr *)&addr, get_addr_len(&addr)) == -1) {
 		close(fd);
 		return 0;
 	}
 
-	close(fd);
-	return 1;
+	/* empty datagram: enough to trigger an ICMP error if unreachable */
+	if (send(fd, "", 0, 0) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+		close(fd);
+		return 0;
+	}
+
+	check->udp_fd = fd + 1;
+	return ok;
 }
 
 /* trace source and events */
@@ -1337,8 +1388,9 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 
 		check->current_step = NULL;
 
-		if (proxy->mode == PR_MODE_UDP) {
-			if (udp_check_connect(check))
+		/* agent checks are regular TCP checks, even for UDP servers */
+		if (proxy->mode == PR_MODE_UDP && !(check->state & CHK_ST_AGENT)) {
+			if (udp_check_run(check))
 				set_server_check_status(check, HCHK_STATUS_L4OK, NULL);
 			else
 				set_server_check_status(check, HCHK_STATUS_L4CON, NULL);
@@ -1618,6 +1670,7 @@ void free_check(struct check *check)
 	ha_free(&check->sni);
 	ha_free(&check->alpn_str);
 	task_destroy(check->task);
+	udp_check_close(check);
 
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);

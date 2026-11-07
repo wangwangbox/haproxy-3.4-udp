@@ -1491,10 +1491,32 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 	return -1;
 }
 
+/* "udp-request" is the same as "tcp-request" but is only meant for "mode udp"
+ * proxies. Elsewhere it is accepted for compatibility but reported.
+ */
+static int tcp_parse_udp_req(char **args, int section_type, struct proxy *curpx,
+                             const struct proxy *defpx, const char *file, int line,
+                             char **err)
+{
+	int ret = tcp_parse_tcp_req(args, section_type, curpx, defpx, file, line, err);
+
+	if (ret >= 0 && !(curpx->cap & PR_CAP_DEF) && curpx->mode != PR_MODE_UDP) {
+		if (*err && **err)
+			memprintf(err, "%s\n'%s' only makes sense in 'mode udp' proxies; in mode %s it behaves exactly like 'tcp-request'",
+			          *err, args[0], proxy_mode_str(curpx->mode));
+		else
+			memprintf(err, "'%s' only makes sense in 'mode udp' proxies; in mode %s it behaves exactly like 'tcp-request'",
+			          args[0], proxy_mode_str(curpx->mode));
+		if (!ret)
+			ret = 1;
+	}
+	return ret;
+}
+
 static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "tcp-request",  tcp_parse_tcp_req },
 	{ CFG_LISTEN, "tcp-response", tcp_parse_tcp_rep },
-	{ CFG_LISTEN, "udp-request",  tcp_parse_tcp_req },
+	{ CFG_LISTEN, "udp-request",  tcp_parse_udp_req },
 	{ 0, NULL, NULL },
 }};
 

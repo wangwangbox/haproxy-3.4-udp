@@ -66,6 +66,7 @@
 #include <haproxy/thread.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
+#include <haproxy/udp_proxy.h>
 #include <haproxy/uri_auth.h>
 
 /* Lock to ensure multiple backends deletion concurrently is safe */
@@ -1876,6 +1877,7 @@ int proxy_finalize(struct proxy *px, int *err_code)
 	case PR_MODE_UDP:
 		cfgerr += proxy_cfg_ensure_no_http(px);
 		cfgerr += proxy_cfg_ensure_no_log(px);
+		cfgerr += udp_proxy_check_proxy(px);
 		break;
 
 	case PR_MODE_SPOP:

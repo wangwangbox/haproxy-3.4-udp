@@ -68,22 +68,73 @@ static const char *common_options[] = {
 	NULL /* must be last */
 };
 
+/* Makes sure all receivers of <bind_conf> are plain UDP over IPv4/IPv6, which
+ * is the only thing "mode udp" knows how to forward, and installs the UDP
+ * proxy I/O handler on them. Returns ERR_NONE or ERR_ALERT|ERR_FATAL.
+ */
+static int cfg_setup_udp_receivers(struct bind_conf *bind_conf, const char *file, int linenum)
+{
+	struct listener *l;
+
+	list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+		if (l->rx.proto->xprt_type != PROTO_TYPE_DGRAM ||
+		    l->rx.proto->proto_type != PROTO_TYPE_DGRAM ||
+		    (l->rx.addr.ss_family != AF_INET && l->rx.addr.ss_family != AF_INET6)) {
+			ha_alert("parsing [%s:%d] : bind '%s' : only plain UDP over IPv4/IPv6 addresses are supported in 'mode udp' (no QUIC nor UNIX sockets).\n",
+			         file, linenum, bind_conf->arg);
+			return ERR_ALERT | ERR_FATAL;
+		}
+		l->rx.iocb = udp_proxy_fd_handler;
+		/* wildcard binds need the destination address of each datagram
+		 * to answer from the address the client contacted.
+		 */
+		if (!is_inet_addr(&l->rx.addr))
+			l->rx.flags |= RX_F_PASS_PKTINFO;
+	}
+	return ERR_NONE;
+}
+
+/* Frees listeners detached by cfg_convert_bind_to_udp(). */
+static void cfg_free_detached_listeners(struct list *list)
+{
+	struct listener *l, *back;
+
+	list_for_each_entry_safe(l, back, list, by_bind) {
+		LIST_DELETE(&l->by_bind);
+		free(l->name);
+		free(l->label);
+		free(l);
+	}
+}
+
 static int cfg_convert_bind_to_udp(struct proxy *px, const char *file, int linenum)
 {
 	struct bind_conf *bind_conf;
 	char *errmsg = NULL;
 
 	list_for_each_entry(bind_conf, &px->conf.bind, by_fe) {
-		struct listener *l, *back;
+		struct listener *l, *back, *old;
+		struct list old_listeners;
 
-		if (bind_conf->options & BC_O_USE_SOCK_DGRAM)
-			continue;
+		/* already converted (e.g. "mode udp" repeated) */
+		if (!LIST_ISEMPTY(&bind_conf->listeners)) {
+			l = LIST_NEXT(&bind_conf->listeners, struct listener *, by_bind);
+			if (l->rx.iocb == udp_proxy_fd_handler)
+				continue;
+		}
 
+		/* Detach the stream listeners. They are only freed once the UDP
+		 * receivers exist so that their id/name/label can be moved over,
+		 * and they must leave the proxy's listener ID tree right now.
+		 */
+		LIST_INIT(&old_listeners);
 		list_for_each_entry_safe(l, back, &bind_conf->listeners, by_bind) {
 			delete_listener(l);
-			LIST_DEL_INIT(&l->by_bind);
 			LIST_DEL_INIT(&l->by_fe);
-			free(l);
+			LIST_DELETE(&l->by_bind);
+			LIST_APPEND(&old_listeners, &l->by_bind);
+			if (l->luid)
+				ceb32_item_delete(&px->conf.used_listener_id, luid_node, luid, l);
 			global.maxsock--;
 		}
 
@@ -109,13 +160,32 @@ static int cfg_convert_bind_to_udp(struct proxy *px, const char *file, int linen
 			else
 				ha_alert("parsing [%s:%d] : cannot convert bind '%s' to udp.\n",
 				         file, linenum, bind_conf->arg);
+			cfg_free_detached_listeners(&old_listeners);
 			return ERR_ALERT | ERR_FATAL;
 		}
 
-		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
-			l->rx.iocb = udp_proxy_fd_handler;
-			global.maxsock++;
+		if (cfg_setup_udp_receivers(bind_conf, file, linenum) & ERR_FATAL) {
+			cfg_free_detached_listeners(&old_listeners);
+			return ERR_ALERT | ERR_FATAL;
 		}
+
+		/* same address string => same receivers, in the same order */
+		old = LIST_NEXT(&old_listeners, struct listener *, by_bind);
+		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+			global.maxsock++;
+			if (&old->by_bind == &old_listeners)
+				continue;
+			if (old->luid) {
+				l->luid = old->luid;
+				listener_index_id(px, l);
+			}
+			l->name = old->name;
+			old->name = NULL;
+			l->label = old->label;
+			old->label = NULL;
+			old = LIST_NEXT(&old->by_bind, struct listener *, by_bind);
+		}
+		cfg_free_detached_listeners(&old_listeners);
 	}
 
 	return ERR_NONE;
@@ -664,9 +734,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		if (curproxy->mode == PR_MODE_UDP) {
+			err_code |= cfg_setup_udp_receivers(bind_conf, file, linenum);
+			if (err_code & ERR_FATAL)
+				goto out;
+		}
+
 		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
-			if (curproxy->mode == PR_MODE_UDP)
-				l->rx.iocb = udp_proxy_fd_handler;
 			/* Set default global rights and owner for unix bind  */
 			global.maxsock++;
 		}
@@ -743,6 +817,17 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			 * if set by default for "haterm" mode.
 			 */
 			curproxy->stream_new_from_sc = stream_new;
+		}
+
+		/* binds declared while in mode udp are UDP receivers and cannot
+		 * be turned back into stream listeners.
+		 */
+		if (curproxy->mode == PR_MODE_UDP && mode != PR_MODE_UDP &&
+		    !(curproxy->cap & PR_CAP_DEF) && !LIST_ISEMPTY(&curproxy->conf.bind)) {
+			ha_alert("parsing [%s:%d] : cannot switch proxy '%s' from mode udp to mode %s after its 'bind' lines; please place 'mode %s' before the 'bind' lines.\n",
+			         file, linenum, curproxy->id, proxy_mode_str(mode), proxy_mode_str(mode));
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
 		}
 
 		curproxy->mode = mode;

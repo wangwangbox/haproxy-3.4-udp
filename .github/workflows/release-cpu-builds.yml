@@ -33,6 +33,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # manual runs must build the tag being published, not the default branch
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
 
       - name: Build HAProxy static binary with musl
         run: |
