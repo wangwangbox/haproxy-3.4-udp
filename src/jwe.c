@@ -405,6 +405,13 @@ static int decrypt_cek_aeskw(struct buffer *cek, struct buffer *decrypted_cek, s
 	EVP_CIPHER_CTX_set_flags(ctx, EVP_CIPHER_CTX_FLAG_WRAP_ALLOW);
 #endif
 
+	/* <crypt_alg> comes from the token's JOSE header, so the attacker picks
+	 * the key size while the secret is operator-provided: refuse to run if
+	 * the secret is shorter than what the cipher will read.
+	 */
+	if (b_data(secret) < EVP_CIPHER_key_length(cipher))
+		goto end;
+
 	iv_size = EVP_CIPHER_iv_length(cipher);
 	iv = alloc_trash_chunk();
 	if (!iv)
@@ -840,15 +847,15 @@ static int do_decrypt_cek_rsa(struct buffer *cek, struct buffer *decrypted_cek,
 			int i;
 			unsigned char *p = (unsigned char *)b_orig(decrypted_cek);
 
-			/* fill 8 bytes at a time */
-			for (i = 0; i <= MAX_DECRYPTED_CEK_LEN - 8; i++) {
+			if (b_size(decrypted_cek) < MAX_DECRYPTED_CEK_LEN)
+				goto end;
+
+			/* fill 8 bytes at a time in a 64 bytes buffer */
+			for (i = 0; i < MAX_DECRYPTED_CEK_LEN; i += 8) {
 				uint64_t r = ha_random64();
 				memcpy(p, &r, 8);
 				p += 8;
 			}
-			/* complete if not multiple of 8 (normally not the case) */
-			for (; i < MAX_DECRYPTED_CEK_LEN; i++)
-				*(p++) = ha_random64();
 
 			outl = MAX_DECRYPTED_CEK_LEN;
 		} else

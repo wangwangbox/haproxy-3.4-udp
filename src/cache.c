@@ -459,8 +459,11 @@ static unsigned int clear_expired_duplicates(struct cache_tree *cache, struct eb
  * duplicate entries (vary), it then checks that the number of entries did not
  * reach the max number of secondary entries. If this entry should not have been
  * created, remove it.
- * In the regular case (unique entries), this function does not do more than a
- * simple insert. In case of secondary entries, it will at most cost an
+ * In the regular case (unique entries), this function inserts the entry in the
+ * tree and checks if a previous entry already existed (which might happen
+ * because the key is only 32bits long and collisions are possible). In such a
+ * case the new entry is removed.
+ * In case of secondary entries, it will at most cost an
  * insertion+max_sec_entries time checks and entry deletion.
  * Returns the newly inserted node in case of success, NULL otherwise.
  *
@@ -479,14 +482,32 @@ static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tr
 
 	/* We should not have multiple entries with the same primary key unless
 	 * the entry has a non null vary signature. */
-	if (!new_entry->secondary_key_signature)
-		return node;
-
 	prev = eb32_prev_dup(node);
 	if (prev != NULL) {
+
+		/* We are either in a standard "Vary" case where secondary
+		 * entries are expected, or we had a collision in the 32 first
+		 * bits of the hash, in which case we want the newly inserted
+		 * entry to be deleted.
+		 */
+		entry = container_of(prev, struct cache_entry, eb);
+		if (memcmp(entry->hash, new_entry->hash, sizeof(entry->hash)) != 0 ||
+		    !new_entry->secondary_key_signature) {
+			/* Collision on the first 4 bytes of the hash or
+			 * unexpected secondary entry, destroy new entry.
+			 * The 'secondary_key_signature' must be reset otherwise
+			 * while trying to delete en entry in 'delete_entry' we
+			 * will try to decrement the secondary_entries_count of
+			 * the same tree line while it was never actually
+			 * incremented for this entry.
+			 */
+			new_entry->secondary_key_signature = 0;
+			release_entry_locked(tree, new_entry);
+			return NULL;
+		}
+
 		/* The last entry of a duplicate list should contain the current
 		 * number of entries in the list. */
-		entry = container_of(prev, struct cache_entry, eb);
 		entry_count = entry->secondary_entries_count;
 		last_clear_ts = entry->last_clear_ts;
 
@@ -2018,6 +2039,7 @@ int sha1_hosturi(struct stream *s)
 
 	/* hash everything */
 	blk_SHA1_Init(&sha1_ctx);
+	blk_SHA1_Update(&sha1_ctx, &cache_hash_seed, sizeof(cache_hash_seed));
 	blk_SHA1_Update(&sha1_ctx, trash->area, trash->data);
 	blk_SHA1_Final((unsigned char *)txn->cache_hash, &sha1_ctx);
 
@@ -2163,15 +2185,21 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 		struct appctx *appctx;
 		int detached = 0;
 
-		retain_entry(res);
-
 		entry_block = block_ptr(res);
 		shctx_wrlock(shctx);
 		if (res->complete) {
+			/* Retaining the entry and detaching its row must happen
+			 * under the same shctx lock: until the row is detached it
+			 * is still in the avail list, and reserving a row does not
+			 * take the cache lock. A row recycled between the lookup
+			 * and this lock no longer has res->complete set, cleared
+			 * by cache_free_blocks() under this same lock.
+			 */
+			retain_entry(res);
 			shctx_row_detach(shctx, entry_block);
 			detached = 1;
 		} else {
-			release_entry(cache_tree, res, 0);
+			/* Nothing was retained on this path. */
 			res = NULL;
 		}
 		shctx_wrunlock(shctx);
@@ -2182,34 +2210,61 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 		 * to find the actual entry we want (if it exists). */
 		if (res && res->secondary_key_signature) {
 			if (!http_request_build_secondary_key(s, res->secondary_key_signature)) {
+				struct cache_entry *to_release = NULL;
+				struct shared_block *to_reattach = NULL;
+
 				cache_rdlock(cache_tree);
 				sec_entry = get_secondary_entry(cache_tree, res,
 				                                s->txn.http->cache_hash,
 				                                s->txn.http->cache_secondary_hash,
 				                                0);
 				if (!sec_entry) {
-					/* Secondary key miss: release the retained primary entry
-					 * and reattach the detached row before returning.
+					/* Secondary key miss: the retained primary entry
+					 * has to be released and its row handed back, but
+					 * not from here, see below.
 					 */
-					release_entry(cache_tree, res, 0);
-					shctx_wrlock(shctx);
-					if (detached)
-						shctx_row_reattach(shctx, entry_block);
-					shctx_wrunlock(shctx);
+					to_release = res;
+					to_reattach = detached ? block_ptr(res) : NULL;
 				}
 				else if (sec_entry != res) {
 					/* The wrong row was added to the hot list. */
-					release_entry(cache_tree, res, 0);
-					retain_entry(sec_entry);
+					to_release = res;
+					to_reattach = detached ? block_ptr(res) : NULL;
 					shctx_wrlock(shctx);
-					if (detached)
-						shctx_row_reattach(shctx, entry_block);
 					entry_block = block_ptr(sec_entry);
+					/* Same as for the primary entry above: retain
+					 * this one under the lock that detaches its
+					 * row.
+					 */
+					retain_entry(sec_entry);
 					shctx_row_detach(shctx, entry_block);
 					shctx_wrunlock(shctx);
 				}
 				res = sec_entry;
 				cache_rdunlock(cache_tree);
+
+				/* release_entry() with needs_locking = 0 means the
+				 * caller already holds the cache write lock, because
+				 * dropping the last reference removes the entry from
+				 * the tree. Called under the read lock as it used to
+				 * be, it let a removal run while other threads walked
+				 * the same tree. Do it here instead, out of the
+				 * read-locked section.
+				 *
+				 * The row is handed back only after the reference has
+				 * been dropped: a row that returns to the avail list
+				 * while a reference is still held on its entry can be
+				 * recycled by another thread, and the release would
+				 * then touch blocks that hold a response body.
+				 */
+				if (to_release) {
+					release_entry(cache_tree, to_release, 1);
+					if (to_reattach) {
+						shctx_wrlock(shctx);
+						shctx_row_reattach(shctx, to_reattach);
+						shctx_wrunlock(shctx);
+					}
+				}
 			}
 			else {
 				release_entry(cache_tree, res, 1);
@@ -2782,12 +2837,13 @@ static int accept_encoding_normalizer(struct htx *htx, struct ist hdr_name,
 #undef ACCEPT_ENCODING_MAX_ENTRIES
 
 /*
- * Normalizer used by default for the Referer and Origin header. It only
- * calculates a hash of the whole value using xxhash algorithm.
- * Only the first occurrence of the header will be taken into account in the
- * hash.
+ * Normalizer used by default for the Referer and Origin header. It calculates
+ * a hash of the whole value using xxhash algorithm. Both headers are single-
+ * valued, but we can't predict how servers would handle extra occurrences,
+ * so better just ignore the secondary keys in case of extra entry, by
+ * returning -1. That way we continue to hash only the full header line.
  * Returns 0 in case of success, 1 if the hash buffer should be filled with 0s
- * and -1 in case of error.
+ * and -1 in case of error (header present more than once).
  */
 static int default_normalizer(struct htx *htx, struct ist hdr_name,
 			      char *buf, unsigned int *buf_len)
@@ -2799,6 +2855,10 @@ static int default_normalizer(struct htx *htx, struct ist hdr_name,
 		retval = 0;
 		write_u64(buf, XXH3(istptr(ctx.value), istlen(ctx.value), cache_hash_seed));
 		*buf_len = sizeof(uint64_t);
+
+		/* Make sure the header is unique and disable caching on duplicate */
+		if (http_find_header(htx, hdr_name, &ctx, 1))
+			retval = -1;
 	}
 
 	return retval;
@@ -2837,8 +2897,6 @@ static int accept_encoding_bitmap_cmp(const void *ref, const void *new, unsigned
  * implementation) of a given request. We have to calculate all the hashes
  * in advance because the actual Vary signature won't be known until the first
  * response.
- * Only the first occurrence of every header will be taken into account in the
- * hash.
  * If the header is not present, the hash portion of the given header will be
  * filled with zeros.
  * Returns 0 in case of success.
@@ -2855,8 +2913,6 @@ static int http_request_prebuild_full_secondary_key(struct stream *s)
  * Calculate the secondary key for a request for which we already have a known
  * vary signature. The key is made by aggregating hashes calculated for every
  * header mentioned in the vary signature.
- * Only the first occurrence of every header will be taken into account in the
- * hash.
  * If the header is not present, the hash portion of the given header will be
  * filled with zeros.
  * Returns 0 in case of success.

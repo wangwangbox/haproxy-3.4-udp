@@ -682,12 +682,12 @@ struct ist http_parse_authority(struct http_uri_parser *parser, int no_userinfo)
 	ptr = start = istptr(parser->uri);
 	end = istend(parser->uri);
 
-	while (ptr < end && *ptr != '/') {
+	while (ptr < end && *ptr != '/' && *ptr != '?' && *ptr != '#') {
 		if (*ptr++ == '@' && no_userinfo)
 			start = ptr;
 	}
 
-	/* OK, ptr point on the '/' or the end */
+	/* OK, ptr point on the '/', the '?', the '#' or the end */
 
   authority:
 	parser->uri = ist2(ptr, end - ptr);
@@ -1139,8 +1139,9 @@ int http_parse_qvalue(const char *qvalue, const char **end)
 		goto out;
 	q = (*qvalue++ - '0') * 1000;
 
-	if (*qvalue++ != '.')
+	if (*qvalue != '.')
 		goto out;
+	qvalue++;
 
 	if (!isdigit((unsigned char)*qvalue))
 		goto out;

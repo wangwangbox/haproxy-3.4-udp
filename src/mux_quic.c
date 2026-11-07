@@ -720,7 +720,17 @@ static void qcm_ctrl_send(struct qc_stream_desc *stream, uint64_t data, uint64_t
 		LIST_DEL_INIT(&qcs->el_send);
 		TRACE_STATE("stream sent done", QMUX_EV_QCS_SEND, qcc->conn, qcs);
 
-		if (qcs->flags & (QC_SF_FIN_STREAM|QC_SF_DETACH)) {
+		/* Everything sent, close the stream if no new data will come.
+		 * This is the case if either FIN has been sent or upper layer
+		 * is detached.
+		 *
+		 * This is also performed if peer has resetted its input as no
+		 * more transfer should occur on this QCS instance.
+		 * TODO this assumption may be invalid depending on QUIC stream
+		 * type - app proto should be responsible to deal with RS.
+		 */
+		if ((qcs->flags & (QC_SF_FIN_STREAM|QC_SF_DETACH)) ||
+		    (!qcs_sc(qcs) && (qcs->flags & QC_SF_RECV_RESET))) {
 			/* Close stream locally. */
 			qcs_close_local(qcs);
 
@@ -1979,8 +1989,8 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 	 * of type FINAL_SIZE_ERROR; see Section 11 for details on error
 	 * handling.
 	 */
-	if (qcs->flags & QC_SF_SIZE_KNOWN &&
-	    (offset + len > qcs->rx.offset_max || (fin && offset + len < qcs->rx.offset_max))) {
+	if (((qcs->flags & QC_SF_SIZE_KNOWN) && offset + len > qcs->rx.offset_max) ||
+	    (fin && offset + len < qcs->rx.offset_max)) {
 		TRACE_ERROR("final size error", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV|QMUX_EV_PROTO_ERR, qcc->conn, qcs);
 		qcc_set_error(qcc, QC_ERR_FINAL_SIZE_ERROR, 0,
 		              muxc_tevt_type_proto_err);
@@ -2354,6 +2364,16 @@ int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t f
 		b = container_of(eb64_first(&qcs->rx.bufs),
 		                 struct qc_stream_rxbuf, off_node);
 		qcs_free_rxbuf(qcs, b);
+	}
+
+	/* No more data will be received after peer reset. QCS can be purged
+	 * if there is nothing to sent on our side.
+	 */
+	if (!qcs_sc(qcs) && !LIST_INLIST(&qcs->el_send)) {
+		qcs_close_local(qcs);
+		TRACE_STATE("add stream in purg_list", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+		LIST_APPEND(&qcs->qcc->purg_list, &qcs->el_send);
+		tasklet_wakeup(qcs->qcc->wait_event.tasklet);
 	}
 
  out:
@@ -4093,6 +4113,12 @@ static int qcm_init(struct connection *conn, struct proxy *prx,
 	if (!conn_is_back(conn)) {
 		/* Register conn for idle front closing. */
 		LIST_APPEND(&mux_stopping_data[tid].list, &conn->stopping_list);
+
+		if (tick_isset(qcc->task->expire)) {
+			/* Activate client timeout until the first bytes of data are received. */
+			TRACE_DEVEL("activate default timeout", QMUX_EV_QCC_NEW, conn);
+			task_queue(qcc->task);
+		}
 
 		/* init read cycle */
 		tasklet_wakeup(qcc->wait_event.tasklet);

@@ -2370,7 +2370,8 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 	if (srv->pp_opts & SRV_PP_V2_CRC32C) {
 		uint32_t zero_crc32c = 0;
 
-		if ((buf_len - ret) < sizeof(struct tlv))
+		/* make sure the whole TLV fits, not just its header */
+		if ((buf_len - ret) < sizeof(struct tlv) + sizeof(zero_crc32c))
 			return 0;
 		tlv_crc32c_p = (void *)((struct tlv *)&buf[ret])->value;
 		ret += make_tlv(&buf[ret], (buf_len - ret), PP2_TYPE_CRC32C, sizeof(zero_crc32c), (const char *)&zero_crc32c);
@@ -2743,7 +2744,16 @@ int smp_fetch_fc_pp_tlv(const struct arg *args, struct sample *smp, const char *
 		return 0;
 
 	idx = args[0].data.sint;
-	conn_tlv = smp->ctx.p ? smp->ctx.p : LIST_ELEM(conn->tlv_list.n, struct conn_tlv_list *, list);
+	conn_tlv = smp->ctx.p;
+	if (conn_tlv) {
+		/* resume *after* the TLV returned on the previous call:
+		 * list_for_each_entry_from() starts on the element it is given, so
+		 * resuming on it would match it again and return it forever
+		 */
+		conn_tlv = LIST_NEXT(&conn_tlv->list, struct conn_tlv_list *, list);
+	}
+	else
+		conn_tlv = LIST_ELEM(conn->tlv_list.n, struct conn_tlv_list *, list);
 	list_for_each_entry_from(conn_tlv, &conn->tlv_list, list) {
 		if (conn_tlv->type == idx) {
 			smp->flags |= SMP_F_NOT_LAST;

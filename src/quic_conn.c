@@ -443,6 +443,7 @@ int quic_build_post_handshake_frames(struct quic_conn *qc,
 	struct quic_frame *frm, *frmbak;
 	struct list frm_list = LIST_HEAD_INIT(frm_list);
 	struct eb64_node *node;
+	uint64_t first_seq_num = qc->next_cid_seq_num;
 
 	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
 
@@ -464,6 +465,8 @@ int quic_build_post_handshake_frames(struct quic_conn *qc,
 			goto err;
 		}
 
+		LIST_APPEND(&frm_list, &frm->list);
+
 		new_token_frm_len =
 			quic_generate_token(frm->new_token.w_data,
 			                    sizeof(frm->new_token.w_data), &qc->peer_addr);
@@ -474,7 +477,6 @@ int quic_build_post_handshake_frames(struct quic_conn *qc,
 
 		BUG_ON(new_token_frm_len != sizeof(frm->new_token.w_data));
 		frm->new_token.len = new_token_frm_len;
-		LIST_APPEND(&frm_list, &frm->list);
 	}
 
 	/* Initialize <max> connection IDs minus one: there is
@@ -537,15 +539,16 @@ int quic_build_post_handshake_frames(struct quic_conn *qc,
 	list_for_each_entry_safe(frm, frmbak, &frm_list, list)
 		qc_frm_free(qc, &frm);
 
-	/* The first CID sequence number value used to allocated CIDs by this function is 1,
-	 * 0 being the sequence number of the CID for this connection.
+	/* Delete the CIDs registered by this very call. They have not been
+	 * advertised, so give their sequence numbers back to keep the ones
+	 * really issued consecutive (RFC 9000 5.1.1).
 	 */
-	node = eb64_lookup_ge(qc->cids, 1);
+	node = eb64_lookup_ge(qc->cids, first_seq_num);
 	while (node) {
 		struct quic_connection_id *conn_id;
 
 		conn_id = eb64_entry(node, struct quic_connection_id, seq_num);
-		if (conn_id->seq_num.key >= max)
+		if (conn_id->seq_num.key >= qc->next_cid_seq_num)
 			break;
 
 		node = eb64_next(node);
@@ -554,6 +557,8 @@ int quic_build_post_handshake_frames(struct quic_conn *qc,
 		eb64_delete(&conn_id->seq_num);
 		pool_free(pool_head_quic_connection_id, conn_id);
 	}
+
+	qc->next_cid_seq_num = first_seq_num;
 	goto leave;
 }
 
@@ -1301,6 +1306,7 @@ struct quic_conn *qc_new_conn(void *target,
 	memset(&qc->rx.params, 0, sizeof(qc->rx.params));
 	qc->rx.buf = b_make(qc->rx.buf.area, QUIC_CONN_RX_BUFSZ, 0, 0);
 	qc->rx.stream_max_uni = qc->rx.stream_max_bidi = 0;
+	qc->rx.auth_fails = 0;
 
 	qc->max_udp_payload = l ?
 	  l->bind_conf->quic_params.max_udp_payload_size :

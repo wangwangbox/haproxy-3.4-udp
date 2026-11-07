@@ -122,6 +122,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          # full history and tags, to list the changes since the previous release
+          fetch-depth: 0
 
       - name: Resolve release tag
         id: tag
@@ -132,6 +136,36 @@ jobs:
             tag="${{ github.ref_name }}"
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          git fetch --force --tags origin
+          prev="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
+          {
+            if [ -n "$prev" ]; then
+              echo "## Changes since ${prev}"
+              range="${prev}..${TAG}"
+            else
+              echo "## Changes"
+              range="${TAG}"
+            fi
+            echo
+            # one section per commit: subject as title, body as details
+            git log --no-merges --format='### %s%n%n%b%n' "$range"               | grep -v -i '^Co-Authored-By:'               | cat -s
+            echo
+            echo "---"
+            echo "HAProxy version: $(cat VERSION) (based on upstream HAProxy $(cut -d. -f1-3 VERSION))"
+            echo
+            echo "Fully static Linux x86-64 HAProxy builds (musl) for x86-64-v1/v2/v3/v4:"
+            echo "- x86-64-v1: baseline x86-64"
+            echo "- x86-64-v2: SSE3/SSSE3/SSE4.x/POPCNT/CX16"
+            echo "- x86-64-v3: AVX/AVX2/BMI/FMA/MOVBE"
+            echo "- x86-64-v4: AVX-512"
+          } > release-notes.md
+          cat release-notes.md
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -149,9 +183,7 @@ jobs:
           find dist -maxdepth 1 -type f -print | sort
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
           else
-            gh release create "$TAG" dist/* \
-              --verify-tag \
-              --title "$TAG" \
-              --notes "Fully static Linux x86-64 HAProxy builds for x86-64-v1/v2/v3/v4."
+            gh release create "$TAG" dist/*               --verify-tag               --title "$TAG"               --notes-file release-notes.md
           fi

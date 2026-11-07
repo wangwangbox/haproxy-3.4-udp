@@ -59,12 +59,23 @@ static const char *common_kw_list[] = {
 	NULL /* must be last */
 };
 
+/* Options which are not described in the cfg_opts* arrays because they need a
+ * dedicated parsing, and which are only used as suggestions for mistyped
+ * words. This list must be kept in sync with the options which have a
+ * dedicated parsing below.
+ */
 static const char *common_options[] = {
-	"httpclose", "http-server-close", "http-keep-alive",
-	"redispatch", "httplog", "tcplog", "tcpka", "httpchk",
-	"ssl-hello-chk", "smtpchk", "pgsql-check", "redis-check",
-	"mysql-check", "ldap-check", "spop-check", "tcp-check",
-	"external-check", "forwardfor", "original-to", "forwarded",
+	"accept-invalid-http-request", "accept-invalid-http-response",
+	"external-check", "forceclose", "forwarded", "forwardfor",
+	"http-keep-alive", "http-restrict-req-hdr-names",
+	"http-server-close", "http-tunnel", "http_proxy", "httpchk",
+	"httpclose", "httplog", "httpslog", "ldap-check", "mysql-check",
+	"originalto", "pgsql-check", "redis-check", "redispatch", "smtpchk",
+#if defined(USE_SPOE)
+	"spop-check",
+#endif
+	"ssl-hello-chk", "tcp-check", "tcpka", "tcplog",
+	"use-small-buffers",
 	NULL /* must be last */
 };
 
@@ -488,14 +499,19 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				err_code |= ERR_ALERT | ERR_FATAL;
 		}
 
-		if ((*args[2] && (!*args[3] || strcmp(args[2], "from") != 0)) ||
-		    alertif_too_many_args(3, file, linenum, args, &err_code)) {
-			if (rc & PR_CAP_FE) {
-				err_code |= ERR_ALERT | ERR_FATAL;
+		if (*args[2] && (!*args[3] || strcmp(args[2], "from") != 0)) {
+			/* the only form taking arguments is "<kw> <name> from <defaults>" */
+			if (rc & PR_CAP_FE)
 				ha_alert("parsing [%s:%d] : please use the 'bind' keyword for listening addresses.\n", file, linenum);
-			}
+			else
+				ha_alert("parsing [%s:%d] : '%s' cannot handle unexpected argument '%s'.\n",
+					 file, linenum, args[0], args[2]);
+			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
+
+		if (alertif_too_many_args(3, file, linenum, args, &err_code))
+			goto out;
 	}
 
 	if (rc & PR_CAP_LISTEN) {  /* new proxy or defaults section */
@@ -902,6 +918,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		d = calloc(1, len);
 		if (!d)
 			goto alloc_error;
+		ha_free(&curproxy->desc);
 		curproxy->desc = d;
 
 		d += snprintf(d, curproxy->desc + len - d, "%s", args[1]);
@@ -1193,7 +1210,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
                 }
 
 		if (strcmp(args[1], "from") == 0) {
-			if (*(args[1]) == 0) {
+			if (*(args[2]) == 0) {
 				ha_alert("parsing [%s:%d] : missing argument after '%s'.\n",
 					 file, linenum, args[1]);
 				err_code |= ERR_ALERT | ERR_FATAL;
@@ -1205,7 +1222,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				goto alloc_error;
 		}
 		else if (strcmp(args[1], "mailers") == 0) {
-			if (*(args[1]) == 0) {
+			if (*(args[2]) == 0) {
 				ha_alert("parsing [%s:%d] : missing argument after '%s'.\n",
 					 file, linenum, args[1]);
 				err_code |= ERR_ALERT | ERR_FATAL;
@@ -1217,7 +1234,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				goto alloc_error;
 		}
 		else if (strcmp(args[1], "myhostname") == 0) {
-			if (*(args[1]) == 0) {
+			if (*(args[2]) == 0) {
 				ha_alert("parsing [%s:%d] : missing argument after '%s'.\n",
 					 file, linenum, args[1]);
 				err_code |= ERR_ALERT | ERR_FATAL;
@@ -1232,13 +1249,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			curproxy->email_alert.level = get_log_level(args[2]);
 			if (curproxy->email_alert.level < 0) {
 				ha_alert("parsing [%s:%d] : unknown log level '%s' after '%s'\n",
-					 file, linenum, args[1], args[2]);
+					 file, linenum, args[2], args[1]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
 		}
 		else if (strcmp(args[1], "to") == 0) {
-			if (*(args[1]) == 0) {
+			if (*(args[2]) == 0) {
 				ha_alert("parsing [%s:%d] : missing argument after '%s'.\n",
 					 file, linenum, args[1]);
 				err_code |= ERR_ALERT | ERR_FATAL;
@@ -1526,7 +1543,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			where |= SMP_VAL_BE_HRQ_HDR;
 		err_code |= warnif_cond_conflicts(rule->cond, where, &errmsg);
 		if (errmsg)
-			ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+			ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 
 		LIST_APPEND(&curproxy->http_req_rules, &rule->list);
 	}
@@ -1561,7 +1578,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			where |= SMP_VAL_BE_HRS_HDR;
 		err_code |= warnif_cond_conflicts(rule->cond, where, &errmsg);
 		if (errmsg)
-			ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+			ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 
 		LIST_APPEND(&curproxy->http_res_rules, &rule->list);
 	}
@@ -1595,7 +1612,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			where |= SMP_VAL_BE_HRS_HDR;
 		err_code |= warnif_cond_conflicts(rule->cond, where, &errmsg);
 		if (errmsg)
-			ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+			ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 
 		LIST_APPEND(&curproxy->http_after_res_rules, &rule->list);
 	}
@@ -1660,7 +1677,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			where |= SMP_VAL_BE_HRQ_HDR;
 		err_code |= warnif_cond_conflicts(rule->cond, where, &errmsg);
 		if (errmsg)
-			ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+			ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 	}
 	else if (strcmp(args[0], "use_backend") == 0) {
 		struct switching_rule *rule;
@@ -1690,7 +1707,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 			err_code |= warnif_cond_conflicts(cond, SMP_VAL_FE_SET_BCK, &errmsg);
 			if (errmsg)
-				ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+				ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 		}
 		else if (*args[2]) {
 			ha_alert("parsing [%s:%d] : unexpected keyword '%s' after switching rule, only 'if' and 'unless' are allowed.\n",
@@ -1753,7 +1770,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		err_code |= warnif_cond_conflicts(cond, SMP_VAL_BE_SET_SRV, &errmsg);
 		if (errmsg)
-			ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+			ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 
 		rule = calloc(1, sizeof(*rule));
 		if (!rule)
@@ -1808,7 +1825,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		 */
 		err_code |= warnif_cond_conflicts(cond, SMP_VAL_BE_REQ_CNT, &errmsg);
 		if (errmsg)
-			ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+			ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 
 		rule = calloc(1, sizeof(*rule));
 		if (!rule) {
@@ -1976,7 +1993,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		else
 			err_code |= warnif_cond_conflicts(cond, SMP_VAL_BE_SET_SRV, &errmsg);
 		if (errmsg)
-			ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+			ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 
 		rule = calloc(1, sizeof(*rule));
 		if (!rule) {
@@ -2034,7 +2051,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				where |= SMP_VAL_BE_HRQ_HDR;
 			err_code |= warnif_cond_conflicts(cond, where, &errmsg);
 			if (errmsg)
-				ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+				ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 
 			rule = calloc(1, sizeof(*rule));
 			if (!rule) {
@@ -2114,7 +2131,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				where |= SMP_VAL_BE_HRQ_HDR;
 			err_code |= warnif_cond_conflicts(rule->cond, where, &errmsg);
 			if (errmsg)
-				ha_warning("parsing [%s:%d] : '%s.\n'", file, linenum, errmsg);
+				ha_warning("parsing [%s:%d] : '%s'.\n", file, linenum, errmsg);
 			LIST_APPEND(&curproxy->uri_auth->http_req_rules, &rule->list);
 
 		} else if (strcmp(args[1], "auth") == 0) {

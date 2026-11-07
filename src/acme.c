@@ -855,6 +855,7 @@ static int cfg_postsection_acme()
 	char *path;
 	char store_path[PATH_MAX]; /* complete path with crt_base */
 	struct stat st;
+	int fd;
 
 	/* if dns-persist-01 is set, add an extra INITIAL_DNS check */
 	if (strcasecmp(cur_acme->challenge, "dns-persist-01") == 0)
@@ -999,6 +1000,16 @@ static int cfg_postsection_acme()
 
 		if ((bio = BIO_new_file(store->path, "w+")) == NULL) {
 			ha_alert("acme: cannot create the file '%s', check your permissions.\n", cur_acme->account.file);
+			err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
+			goto out;
+		}
+
+		/* the file is created with the process' umask applied, which
+		 * commonly leaves it world-readable; this is an unencrypted
+		 * private key, restrict it before writing anything into it.
+		 */
+		if (BIO_get_fd(bio, &fd) > 0 && fchmod(fd, S_IRUSR | S_IWUSR) == -1) {
+			ha_alert("acme: cannot set the permissions of the file '%s'.\n", cur_acme->account.file);
 			err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
 			goto out;
 		}
@@ -1263,8 +1274,8 @@ static void acme_del_challenge_map(const char *map, const char *challenge)
 {
 	struct pat_ref *ref;
 
-	/* when no map configured, return without error */
-	if (!map)
+	/* no map configured, or no challenge token was retrieved */
+	if (!map || !challenge)
 		return;
 
 	ref = pat_ref_lookup(map);
@@ -1308,6 +1319,11 @@ int acme_http_req(struct task *task, struct acme_ctx *ctx, struct ist url, enum 
 
 	if (httpclient_req_gen(hc, hc->req.url, hc->req.meth, hdrs, payload) != ERR_NONE)
 		goto error;
+
+	/* The response payload is not consumed on the fly. It is retrieved at
+	 * the end of the response.
+	 */
+	hc->options |= HTTPCLIENT_O_RES_ACCUM;
 
 	hc->ops.res_end = acme_httpclient_end;
 

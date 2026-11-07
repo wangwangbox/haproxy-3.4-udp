@@ -3027,6 +3027,12 @@ static int h2c_ack_settings(struct h2c *h2c)
  */
 static int h2c_handle_ping(struct h2c *h2c)
 {
+	/* process full frame only */
+	if (b_data(&h2c->dbuf) < h2c->dfl) {
+		h2c->flags |= H2_CF_DEM_SHORT_READ;
+		return 0;
+	}
+
 	if (h2c->dff & H2_F_PING_ACK) {
 		TRACE_PROTO("receiving H2 PING ACK frame", H2_EV_RX_FRAME|H2_EV_RX_PING, h2c->conn);
 		if ((h2c->flags & (H2_CF_IDL_PING|H2_CF_IDL_PING_SENT)) == H2_CF_IDL_PING_SENT) {
@@ -5399,6 +5405,7 @@ static int h2_wake(struct connection *conn)
 		if (unlikely(conn_reverse_in_preconnect(conn)) && h2c_is_dead(h2c)) {
 			TRACE_DEVEL("leaving and killing dead connection", H2_EV_STRM_END, h2c->conn);
 			h2_release(h2c);
+			ret = -1;
 		}
 	}
 
@@ -6050,11 +6057,11 @@ struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state)
 		h2_remove_from_list(h2s);
 
 		if (!h2s_sc(h2s)) {
+			/* note: this frees the tasklet as well */
 			h2s_destroy(h2s);
-			if (h2c_is_dead(h2c)) {
+			t = NULL;
+			if (h2c_is_dead(h2c))
 				h2_release(h2c);
-				t = NULL;
-			}
 		}
 	}
  end:
@@ -6447,6 +6454,29 @@ next_frame:
 
  trailers:
 	/* This is the last HEADERS frame hence a trailer */
+	if ((*flags & H2_SF_BODY_TUNNEL) ||
+	    (!(h2c->flags & H2_CF_IS_BACK) && (*flags & H2_SF_TUNNEL_ABRT))) {
+		/* No trailers are expected on a tunneled stream. The end of the
+		 * HTTP message was already reported, just after the headers, so
+		 * only tunneled data may be received now.
+		 *
+		 * On the request side, this remains true when the tunnel attempt
+		 * was aborted, because the early end of the message was already
+		 * reported for the CONNECT request. But not on the response
+		 * side: an aborted tunnel means the response is a regular one,
+		 * with a payload and thus possibly with trailers. In this case,
+		 * no early end of the message was reported.
+		 *
+		 * Note: Regarding the RFC, it is not strickly speaking
+		 * forbidden. But internally, we don't know how to handle such
+		 * frames. So better to reject them.
+		 */
+		h2c_report_glitch(h2c, 1, "rcvd trailers on a tunneled stream");
+		TRACE_STATE("rcvd trailers on a tunneled stream", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2S_ERR|H2_EV_PROTO_ERR, h2c->conn);
+		HA_ATOMIC_INC(&h2c->px_counters->strm_proto_err);
+		goto fail;
+	}
+
 	if (!(h2c->dff & H2_F_HEADERS_END_STREAM)) {
 		/* It's a trailer but it's missing ES flag */
 		h2c_report_glitch(h2c, 1, "missing EH on trailers frame");
@@ -6524,7 +6554,7 @@ try_again:
 	block = htx_free_data_space(htx);
 	if (!block) {
 		if (h2s_get_rxbuf(h2s))
-			goto next_buffer;
+			goto switch_buffer;
 
 		h2c->flags |= H2_CF_DEM_SFULL;
 		TRACE_STATE("h2s rxbuf is full", H2_EV_RX_FRAME|H2_EV_RX_DATA|H2_EV_H2S_BLK, h2c->conn, h2s);
@@ -6549,7 +6579,7 @@ try_again:
 
 	if (sent < flen) {
 		if (h2s_get_rxbuf(h2s))
-			goto next_buffer;
+			goto switch_buffer;
 
 		h2c->flags |= H2_CF_DEM_SFULL;
 		TRACE_STATE("h2s rxbuf is full", H2_EV_RX_FRAME|H2_EV_RX_DATA|H2_EV_H2S_BLK, h2c->conn, h2s);
@@ -6557,6 +6587,15 @@ try_again:
 	}
 
 	goto try_again;
+
+ switch_buffer:
+	/* the current rxbuf is full and a new slot was assigned to the
+	 * stream: release the current HTX message before switching to the
+	 * next buffer, whose allocation may fail.
+	 */
+	htx_to_buf(htx, scbuf);
+	htx = NULL;
+	goto next_buffer;
 
  end_transfer:
 	/* here we're done with the frame, all the payload (except padding) was
@@ -6584,9 +6623,18 @@ try_again:
 		 * EOM was already reported.
 		 */
 		if ((h2c->flags & H2_CF_IS_BACK) || !(h2s->flags & H2_SF_TUNNEL_ABRT)) {
-			/* htx may be empty if receiving an empty DATA frame. */
-			if (!htx_set_eom(htx))
-				goto fail;
+			/*
+			 * Do not report end of message if we had a
+			 * Content-Length, but we got less than that, otherwise
+			 * the other mux will consider it complete when it
+			 * should not.
+			 */
+			if (!(h2s->flags & H2_SF_DATA_CLEN) || !h2s->body_len ||
+			    ((h2c->flags & H2_CF_IS_BACK) && (h2s->flags & H2_SF_BODYLESS_RESP))) {
+				/* htx may be empty if receiving an empty DATA frame. */
+				if (!htx_set_eom(htx))
+					goto fail;
+			}
 		}
 	}
 
@@ -6653,7 +6701,7 @@ static size_t h2s_snd_fhdrs(struct h2s *h2s, struct htx *htx)
 			BUG_ON(sl); /* Only one start-line expected */
 			sl = htx_get_blk_ptr(htx, blk);
 			h2s->status = sl->info.res.status;
-			if (sl->flags & HTX_SL_F_XFER_LEN)
+			if ((sl->flags & HTX_SL_F_XFER_LEN) && (h2s->status == 101 || h2s->status >= 200))
 				h2s->flags |= H2_SF_MORE_HTX_DATA;
 			if ((sl->flags & HTX_SL_F_BODYLESS_RESP) || h2s->status == 204 || h2s->status == 304)
 				h2s->flags |= H2_SF_BODYLESS_RESP;
@@ -7082,6 +7130,7 @@ static size_t h2s_snd_bhdrs(struct h2s *h2s, struct htx *htx)
 		 * from rfc 8441.
 		 */
 		struct ist scheme = { };
+		struct ist at;
 
 		if (uri.ptr[0] != '/' && uri.ptr[0] != '*') {
 			/* the URI seems to start with a scheme */
@@ -7101,6 +7150,11 @@ static size_t h2s_snd_bhdrs(struct h2s *h2s, struct htx *htx)
 					auth.len++;
 
 				uri = istadv(uri, auth.len);
+
+				/* RFC9113#8.3.1: :authority must not carry the deprecated userinfo */
+				at = istfind(auth, '@');
+				if (istlen(at))
+					auth = istadv(at, 1);
 			}
 		}
 
@@ -7879,6 +7933,12 @@ static int h2_subscribe(struct stconn *sc, int event_type, struct wait_event *es
 
 	if (event_type & SUB_RETRY_SEND) {
 		TRACE_DEVEL("subscribe(send)", H2_EV_STRM_SEND, h2c->conn, h2s);
+		/*
+		 * If the caller subscribes, that means he was enable to send
+		 * data, so let's not pretend it has already been notified
+		 * he could, this is obviously obsolete.
+		 */
+		h2s->flags &= ~H2_SF_NOTIFIED;
 		if (!(h2s->flags & H2_SF_BLK_SFCTL) &&
 		    !LIST_INLIST(&h2s->list)) {
 			if (h2s->flags & H2_SF_BLK_MFCTL) {
@@ -8499,10 +8559,13 @@ static int h2_dump_h2s_info(struct buffer *msg, const struct h2s *h2s, const cha
 	if (pfx)
 		chunk_appendf(msg, "\n%s", pfx);
 
-	chunk_appendf(msg, " .sc=%p", h2s_sc(h2s));
-	if (h2s_sc(h2s))
-		chunk_appendf(msg, "(.flg=0x%08x .app=%p)",
-			      h2s_sc(h2s)->flags, h2s_sc(h2s)->app);
+	if (h2s->sd) {
+		/* h2s_sc requires an sd! */
+		chunk_appendf(msg, " .sc=%p", h2s_sc(h2s));
+		if (h2s_sc(h2s))
+			chunk_appendf(msg, "(.flg=0x%08x .app=%p)",
+				      h2s_sc(h2s)->flags, h2s_sc(h2s)->app);
+	}
 
 	chunk_appendf(msg, " .sd=%p", h2s->sd);
 	if (h2s->sd)

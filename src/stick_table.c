@@ -191,8 +191,19 @@ void stksess_setkey(struct stktable *t, struct stksess *ts, struct stktable_key 
 	if (t->type != SMP_T_STR)
 		memcpy(ts->key.key, key->key, t->key_size);
 	else {
-		memcpy(ts->key.key, key->key, MIN(t->key_size - 1, key->key_len));
-		ts->key.key[MIN(t->key_size - 1, key->key_len)] = 0;
+		int key_len = key->key_len;
+
+		if (key_len > t->key_size - 1)
+			key_len = t->key_size - 1;
+
+		if (key_len + t->proto_size > global.tune.bufsize)
+			key_len = global.tune.bufsize - t->proto_size;
+
+		if (key_len < 0)
+			key_len = 0;
+
+		memcpy(ts->key.key, key->key, key_len);
+		ts->key.key[key_len] = 0;
 	}
 }
 
@@ -505,8 +516,15 @@ struct stksess *stktable_lookup_key(struct stktable *t, struct stktable_key *key
 	uint bucket;
 	size_t len;
 
-	if (t->type == SMP_T_STR)
+	if (t->type == SMP_T_STR) {
 		len = key->key_len + 1 < t->key_size ? key->key_len : t->key_size - 1;
+		/* the stored key is NUL-terminated, so all the other bucket
+		 * computations stop at the first NUL. Do the same here or an
+		 * embedded NUL would yield two different buckets for a same
+		 * entry.
+		 */
+		len = strnlen2(key->key, len);
+	}
 	else
 		len = t->key_size;
 
@@ -780,8 +798,11 @@ struct stksess *stktable_get_entry(struct stktable *table, struct stktable_key *
 	if (!key)
 		return NULL;
 
-	if (table->type == SMP_T_STR)
+	if (table->type == SMP_T_STR) {
 		len = key->key_len + 1 < table->key_size ? key->key_len : table->key_size - 1;
+		/* see stktable_lookup_key() about the NUL truncation */
+		len = strnlen2(key->key, len);
+	}
 	else
 		len = table->key_size;
 
@@ -1375,6 +1396,7 @@ int stktable_alloc_data_type(struct stktable *t, int type, const char *sa, const
 	}
 
 	t->data_size      += t->data_nbelem[type] * stktable_type_size(stktable_data_types[type].std_type);
+	t->proto_size     += t->data_nbelem[type] * stktable_type_proto_size(stktable_data_types[type].std_type);
 	t->data_ofs[type]  = -t->data_size;
 	return PE_NONE;
 }
@@ -1665,6 +1687,20 @@ int parse_stick_table(const char *file, int linenum, char **args,
 	if (t->type == (unsigned int)-1) {
 		ha_alert("parsing [%s:%d] : %s: missing type.\n",
 			 file, linenum, args[0]);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	/* the key is sent as-is for most types (string is trimmed), and 11
+	 * extra bytes of encapsulation are added when sending (measured).
+	 */
+	t->proto_size += 11;
+	if (t->type != SMP_T_STR)
+		t->proto_size += t->key_size;
+
+	if (t->proto_size > global.tune.bufsize) {
+		ha_alert("parsing [%s:%d] : %s: too large key+data (%d bytes on wire) for bufsize (%u). Reduce key len, reduce stored data, or increase tune.bufsize.\n",
+			 file, linenum, args[0], t->proto_size, global.tune.bufsize);
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto out;
 	}
@@ -2674,7 +2710,7 @@ static int sample_conv_table_trackers(const struct arg *arg_p, struct sample *sm
 	if (!ts)
 		return 1;
 
-	smp->data.u.sint = HA_ATOMIC_LOAD(&ts->ref_cnt);
+	smp->data.u.sint = HA_ATOMIC_LOAD(&ts->ref_cnt) - 1; // don't count ourselves
 
 	stktable_release(t, ts);
 	return 1;

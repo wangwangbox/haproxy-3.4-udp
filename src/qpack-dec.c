@@ -70,11 +70,16 @@ static uint64_t qpack_get_varint(const unsigned char **buf, uint64_t *len_in, in
 		if (!len)
 			goto too_short;
 
+		/* A valid QPACK varint is at most 62 bits. Zero-payload
+		 * continuations must not drive shift past 63, otherwise the
+		 * "(limit - ret) >> shift" check below runs with an out-of-range
+		 * shift count (C undefined behavior).
+		 */
+		if (shift >= 63)
+			goto too_large;
 		v = *raw++;
 		len--;
-		/* This check is sufficient to prevent any overflow
-		 * and implicitly limits shift to 63.
-		 */
+		/* This check is sufficient to prevent any overflow. */
 		if ((v & 127) > (limit - ret) >> shift)
 			goto too_large;
 
@@ -93,9 +98,30 @@ too_short:
 	return 0;
 }
 
+/* Return the length in bytes of the QPACK prefix integer at the head of <buf>,
+ * whose first byte carries <prefix_bits> significant bits. Returns 0 if the
+ * integer is not complete yet, or a negative value if it is too long to be a
+ * valid one.
+ */
+static int qpack_prefix_int_len(const struct buffer *buf, int prefix_bits)
+{
+	/* One prefix byte plus the nine continuations of a 62-bit value. */
+	unsigned char tmp[10];
+	const unsigned char *raw = tmp;
+	uint64_t len = MIN(sizeof tmp, b_data(buf));
+
+	b_getblk(buf, (char *)tmp, len, 0);
+	qpack_get_varint(&raw, &len, prefix_bits);
+
+	/* A truncated and a too large integer are reported the same way. */
+	if (len == (uint64_t)-1)
+		return b_data(buf) < sizeof tmp ? 0 : -1;
+
+	return raw - tmp;
+}
+
 /* Decode an encoder stream.
- *
- * Returns 0 on success else non-zero.
+ * Returns the number of consumed bytes or a negative error code.
  */
 int qpack_decode_enc(struct buffer *buf, int fin, void *ctx)
 {
@@ -125,16 +151,7 @@ int qpack_decode_enc(struct buffer *buf, int fin, void *ctx)
 	}
 
 	inst = (unsigned char)*b_head(buf) & QPACK_ENC_INST_BITMASK;
-	if (inst == QPACK_ENC_INST_DUP) {
-		/* Duplicate */
-	}
-	else if (inst & QPACK_ENC_INST_IWNR_BIT) {
-		/* Insert With Name Reference */
-	}
-	else if (inst & QPACK_ENC_INST_IWLN_BIT) {
-		/* Insert with literal name */
-	}
-	else if (inst & QPACK_ENC_INST_SDTC_BIT) {
+	if (inst & QPACK_ENC_INST_SDTC_BIT) {
 		/* Set dynamic table capacity */
 		int capacity = *b_head(buf) & 0x1f;
 
@@ -150,20 +167,26 @@ int qpack_decode_enc(struct buffer *buf, int fin, void *ctx)
 			return -1;
 		}
 
+		return 1;
 	}
 
-	return 0;
+	/* haproxy advertises a null dynamic table capacity, so the peer must not
+	 * insert anything.
+	 */
+	qcc_set_error(qcs->qcc, QPACK_ERR_ENCODER_STREAM_ERROR, 1,
+	              muxc_tevt_type_proto_err);
+	return -1;
 }
 
 /* Decode an decoder stream.
- *
- * Returns 0 on success else non-zero.
+ * Returns the number of consumed bytes or a negative error code.
  */
 int qpack_decode_dec(struct buffer *buf, int fin, void *ctx)
 {
 	struct qcs *qcs = ctx;
 	size_t len;
 	unsigned char inst;
+	int rdlen;
 
 	/* RFC 9204 4.2. Encoder and Decoder Streams
 	 *
@@ -186,8 +209,8 @@ int qpack_decode_dec(struct buffer *buf, int fin, void *ctx)
 		return 0;
 	}
 
-	inst = (unsigned char)*b_head(buf) & QPACK_DEC_INST_BITMASK;
-	if (inst == QPACK_DEC_INST_ICINC) {
+	inst = (unsigned char)*b_head(buf);
+	if (!(inst & (QPACK_DEC_INST_SACK | QPACK_DEC_INST_SCCL))) {
 		/* Insert count increment */
 
 		/* RFC 9204 4.4.3. Insert Count Increment
@@ -203,14 +226,23 @@ int qpack_decode_dec(struct buffer *buf, int fin, void *ctx)
 		              muxc_tevt_type_proto_err);
 		return -1;
 	}
-	else if (inst & QPACK_DEC_INST_SACK) {
-		/* Section Acknowledgment */
-	}
-	else if (inst & QPACK_DEC_INST_SCCL) {
-		/* Stream cancellation */
+
+	/* Section Acknowledgment and Stream Cancellation both carry a stream ID
+	 * which is of no use here, as haproxy encodes every field section with a
+	 * null Required Insert Count. Skip them.
+	 */
+	if (inst & QPACK_DEC_INST_SACK)
+		rdlen = qpack_prefix_int_len(buf, 7);
+	else
+		rdlen = qpack_prefix_int_len(buf, 6);
+
+	if (rdlen < 0) {
+		qcc_set_error(qcs->qcc, QPACK_ERR_DECODER_STREAM_ERROR, 1,
+		              muxc_tevt_type_proto_err);
+		return -1;
 	}
 
-	return 0;
+	return rdlen;
 }
 
 /* Decode a field section prefix made of <enc_ric> and <db> two varints.
@@ -263,6 +295,16 @@ int qpack_decode_fs(const unsigned char *raw, uint64_t len, struct buffer *tmp,
 	ret = qpack_decode_fs_pfx(&enc_ric, &db, &s, &raw, &len);
 	if (ret < 0) {
 		qpack_debug_printf(stderr, "##ERR@%d(%d)\n", __LINE__, ret);
+		goto out;
+	}
+
+	/* RFC 9204 4.5.1.1
+	 * haproxy advertises a null dynamic table capacity, so a conformant
+	 * encoder cannot produce a non null Encoded Required Insert Count.
+	 */
+	if (enc_ric) {
+		qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
+		ret = -QPACK_RET_DECOMP;
 		goto out;
 	}
 

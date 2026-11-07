@@ -1063,8 +1063,12 @@ static void h1s_destroy(struct h1s *h1s)
 {
 	if (h1s) {
 		struct h1c *h1c = h1s->h1c;
+		/* after a mux upgrade (e.g. H1 to H2), the connection does not
+		 * belong to us anymore and must not be passed to traces.
+		 */
+		struct connection *conn = (h1c->conn && h1c->conn->ctx == h1c) ? h1c->conn : NULL;
 
-		TRACE_POINT(H1_EV_H1S_END, h1c->conn, h1s);
+		TRACE_POINT(H1_EV_H1S_END, conn, h1s);
 		h1c->h1s = NULL;
 
 		if (h1s->subs)
@@ -1077,6 +1081,15 @@ static void h1s_destroy(struct h1s *h1s)
 				H1C_F_IN_SALLOC|H1C_F_IN_SMAYALLOC|
 				H1C_F_CO_MSG_MORE|H1C_F_CO_STREAMER);
 
+		/*
+		 * If we reached the end of the stream and sent less bits than
+		 * announced in Content-Length, we have little choice but to
+		 * close the connection, as the peer will expect more.
+		 */
+		if ((h1s->req.curr_len && !(h1s->flags & H1S_F_BODYLESS_REQ)) ||
+		    (h1s->res.curr_len && !(h1s->flags & H1S_F_BODYLESS_RESP)))
+			h1c->flags |= H1C_F_ERROR;
+
 		if (!(h1c->flags & (H1C_F_EOS|H1C_F_ERR_PENDING|H1C_F_ERROR|H1C_F_ABRT_PENDING|H1C_F_ABRTED)) &&  /* No error/read0/abort */
 		    h1_is_alive(h1c) &&                                                      /* still alive */
 		    (h1s->flags & H1S_F_WANT_KAL) &&                                         /* K/A possible */
@@ -1084,11 +1097,11 @@ static void h1s_destroy(struct h1s *h1s)
 			h1c->state = H1_CS_IDLE;
 			h1c->flags |= H1C_F_WAIT_NEXT_REQ;
 			h1c->req_count++;
-			TRACE_STATE("set idle mode on h1c, waiting for the next request", H1_EV_H1C_ERR, h1c->conn, h1s);
+			TRACE_STATE("set idle mode on h1c, waiting for the next request", H1_EV_H1C_ERR, conn, h1s);
 		}
 		else {
 			h1_close(h1c);
-			TRACE_STATE("close h1c", H1_EV_H1S_END, h1c->conn, h1s);
+			TRACE_STATE("close h1c", H1_EV_H1S_END, conn, h1s);
 		}
 
 		HA_ATOMIC_DEC(&h1c->px_counters->open_streams);
@@ -2630,6 +2643,8 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 	struct buffer outbuf;
 	enum htx_blk_type type;
 	struct ist n, v;
+	unsigned long long body_len;
+	unsigned int hdr_flags;
 	uint32_t sz;
 	size_t ret = 0;
 
@@ -2648,6 +2663,12 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 			if (sz > count)
 				goto error;
 
+			/* H1S flags to set once the header is emitted. They must
+			 * not be set before, because if the header does not fit,
+			 * it is processed again on the next call.
+			 */
+			hdr_flags = 0;
+
 			n = htx_get_blk_name(htx, blk);
 			v = htx_get_blk_value(htx, blk);
 
@@ -2663,10 +2684,10 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 				if (h1s->flags & H1S_F_HAVE_CHNK)
 					goto nextblk;
 				v = ist("chunked");
-				h1s->flags |= H1S_F_HAVE_CHNK;
+				hdr_flags = H1S_F_HAVE_CHNK;
                         }
 			else if (isteq(n, ist("content-length"))) {
-				unsigned long long body_len = h1m->body_len;
+				body_len = h1m->body_len;
 
 				/* Report error for invalid content-length.
 				 * Skip custom content-length headers except "content-length: 0"
@@ -2680,8 +2701,7 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 					goto nextblk;
 				if (h1s->flags & H1S_F_HAVE_CLEN)
 					goto nextblk;
-				h1m->curr_len = h1m->body_len = body_len;
-				h1s->flags |= H1S_F_HAVE_CLEN;
+				hdr_flags = H1S_F_HAVE_CLEN;
 			}
 			else if (isteq(n, ist("connection"))) {
 				/* copy the value because it can be modified, but the HTX blocks will not */
@@ -2720,6 +2740,10 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 
 			if (!h1_format_htx_hdr(n, v, &outbuf, hdrs_map))
 				goto full;
+
+			if (hdr_flags & H1S_F_HAVE_CLEN)
+				h1m->curr_len = h1m->body_len = body_len;
+			h1s->flags |= hdr_flags;
 		}
 		else if (type == HTX_BLK_EOH) {
 			h1m->state = H1_MSG_LAST_LF;
@@ -3249,6 +3273,12 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 				 */
 			}
 			else if (h1m->flags & H1_MF_CHNK) {
+				if (h1m->curr_len) {
+					COUNT_IF(1, "chunk smaller than announced");
+					TRACE_ERROR("chunk smaller than announced",
+						    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
+					goto error;
+				}
 				/* Emit last chunk for chunked messages only */
 				if (!chunk_memcat(&outbuf, "0\r\n", 3))
                                         goto full;
@@ -3784,13 +3814,13 @@ static int h1_send_error(struct h1c *h1c)
 		}
 	}
 
+  out_abort:
 	if (h1c->state == H1_CS_EMBRYONIC) {
 		BUG_ON(h1c->h1s == NULL || h1s_sc(h1c->h1s) != NULL);
 		TRACE_DEVEL("Abort embryonic H1S", H1_EV_H1C_ERR, h1c->conn, h1c->h1s);
 		h1s_destroy(h1c->h1s);
 	}
 
-  out_abort:
 	h1c->flags = (h1c->flags & ~(H1C_F_WAIT_NEXT_REQ|H1C_F_ABRT_PENDING)) | H1C_F_ABRTED;
 	h1_close(h1c);
   out:
@@ -4158,7 +4188,8 @@ static int h1_process(struct h1c * h1c)
 		 */
 		if (h1c->state != H1_CS_DRAINING &&
 		    b_isteq(&h1c->ibuf, 0, b_data(&h1c->ibuf), ist(H2_CONN_PREFACE)) > 0) {
-			if (!(h1c->flags & H1C_F_WAIT_NEXT_REQ) &&         /* First request */
+			if (!(h1c->flags & H1C_F_WAIT_NEXT_REQ) &&         /* First request (the flag is */
+			    !(h1s && (h1s->flags & H1S_F_NOT_FIRST)) &&    /*   moved to the h1s once created) */
 			    !(h1c->px->options2 & PR_O2_NO_H2_UPGRADE) &&  /* H2 upgrade supported by the proxy */
 			    !(conn->mux->flags & MX_FL_NO_UPG)) {          /* the current mux supports upgrades */
 				h1c->flags |= H1C_F_UPG_H2C;

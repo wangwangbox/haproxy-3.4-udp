@@ -1035,7 +1035,7 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 	r_res = &resolution->response;
 
 	/* query id */
-	if (reader + 2 >= bufend)
+	if (reader + 2 > bufend)
 		goto invalid_resp;
 
 	r_res->header.id = reader[0] * 256 + reader[1];
@@ -1049,7 +1049,7 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 	 *  - truncated (1 bit)
 	 *  - recursion desired (1 bit)
 	 */
-	if (reader + 2 >= bufend)
+	if (reader + 2 > bufend)
 		goto invalid_resp;
 
 	flags = reader[0] * 256 + reader[1];
@@ -1073,7 +1073,7 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 	reader += 2;
 
 	/* 2 bytes for question count */
-	if (reader + 2 >= bufend)
+	if (reader + 2 > bufend)
 		goto invalid_resp;
 	r_res->header.qdcount = reader[0] * 256 + reader[1];
 	/* (for now) we send one query only, so we expect only one in the
@@ -1088,13 +1088,9 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 	reader += 2;
 
 	/* 2 bytes for answer count */
-	if (reader + 2 >= bufend)
+	if (reader + 2 > bufend)
 		goto invalid_resp;
 	r_res->header.ancount = reader[0] * 256 + reader[1];
-	if (r_res->header.ancount == 0) {
-		cause = RSLV_RESP_ANCOUNT_ZERO;
-		goto return_error;
-	}
 
 	/* Check if too many records are announced */
 	if (r_res->header.ancount > max_answer_records)
@@ -1102,13 +1098,13 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 	reader += 2;
 
 	/* 2 bytes authority count */
-	if (reader + 2 >= bufend)
+	if (reader + 2 > bufend)
 		goto invalid_resp;
 	r_res->header.nscount = reader[0] * 256 + reader[1];
 	reader += 2;
 
 	/* 2 bytes additional count */
-	if (reader + 2 >= bufend)
+	if (reader + 2 > bufend)
 		goto invalid_resp;
 	r_res->header.arcount = reader[0] * 256 + reader[1];
 	reader += 2;
@@ -1138,13 +1134,13 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 	previous_dname = query->name;
 
 	/* move forward 2 bytes for question type */
-	if (reader + 2 >= bufend)
+	if (reader + 2 > bufend)
 		goto invalid_resp;
 	query->type = reader[0] * 256 + reader[1];
 	reader += 2;
 
 	/* move forward 2 bytes for question class */
-	if (reader + 2 >= bufend)
+	if (reader + 2 > bufend)
 		goto invalid_resp;
 	query->class = reader[0] * 256 + reader[1];
 	reader += 2;
@@ -1154,6 +1150,11 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 	 */
 	if (query->type != DNS_RTYPE_SRV && flags & DNS_FLAG_TRUNCATED) {
 		cause = RSLV_RESP_TRUNCATED;
+		goto return_error;
+	}
+
+	if (r_res->header.ancount == 0) {
+		cause = RSLV_RESP_ANCOUNT_ZERO;
 		goto return_error;
 	}
 
@@ -2340,7 +2341,6 @@ static int resolv_process_responses(struct dns_nameserver *ns)
 	/* process all pending input messages */
 	while (1) {
 		/* read message received */
-		memset(buf, '\0', resolvers->accepted_payload_size + 1);
 		if ((buflen = dns_recv_nameserver(ns, (void *)buf, sizeof(buf))) <= 0) {
 			break;
 		}

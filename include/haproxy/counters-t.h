@@ -106,6 +106,11 @@ struct fe_counters_shared {
 
 /* counters used by listeners and frontends */
 struct fe_counters {
+	/* shared must stay the first member: counters_fe_reset() zeroes
+	 * everything after it in one memset, so any new field added below is
+	 * reset automatically. It holds the shared.tg pointer array which the
+	 * hot path dereferences without a NULL check and must never be zeroed.
+	 */
 	struct fe_counters_shared shared;       /* shared counters */
 	unsigned int conn_max;                  /* max # of active sessions */
 
@@ -165,6 +170,11 @@ struct be_counters_shared {
 
 /* counters used by servers and backends */
 struct be_counters {
+	/* shared must stay the first member: counters_be_reset() zeroes
+	 * everything after it in one memset, so any new field added below is
+	 * reset automatically. It holds the shared.tg pointer array which the
+	 * hot path dereferences without a NULL check and must never be zeroed.
+	 */
 	struct be_counters_shared shared;       /* shared counters */
 	unsigned int conn_max;                  /* max # of active sessions */
 

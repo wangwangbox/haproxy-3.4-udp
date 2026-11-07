@@ -131,9 +131,12 @@ static SSL_CTX *ssl_sock_do_create_cert(const char *servername, struct bind_conf
 	if (!ssl_sock_sni_is_valid(servername))
 		goto mkcert_error;
 
+	HA_RWLOCK_RDLOCK(SNI_LOCK, &bind_conf->sni_lock);
 	sni_ctx = ssl_sock_choose_sni_ctx(bind_conf, NULL, "", 1, 1);
-	if (!sni_ctx)
+	if (!sni_ctx) {
+		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &bind_conf->sni_lock);
 		goto mkcert_error;
+	}
 
 	/* Get the private key of the default certificate and use it */
 #ifdef HAVE_SSL_CTX_get0_privatekey
@@ -143,8 +146,12 @@ static SSL_CTX *ssl_sock_do_create_cert(const char *servername, struct bind_conf
 	if (tmp_ssl)
 		pkey = SSL_get_privatekey(tmp_ssl);
 #endif
-	if (!pkey)
+	if (!pkey) {
+		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &bind_conf->sni_lock);
 		goto mkcert_error;
+	}
+	EVP_PKEY_up_ref(pkey);
+	HA_RWLOCK_RDUNLOCK(SNI_LOCK, &bind_conf->sni_lock);
 
 	/* Create the certificate */
 	if (!(newcrt = X509_new()))
@@ -301,6 +308,7 @@ static SSL_CTX *ssl_sock_do_create_cert(const char *servername, struct bind_conf
  end:
 	if (ctmp) NCONF_free(ctmp);
 	if (tmp_ssl) SSL_free(tmp_ssl);
+	EVP_PKEY_free(pkey);
 	return ssl_ctx;
 
  mkcert_error:
@@ -308,6 +316,7 @@ static SSL_CTX *ssl_sock_do_create_cert(const char *servername, struct bind_conf
 	if (tmp_ssl) SSL_free(tmp_ssl);
 	if (ssl_ctx) SSL_CTX_free(ssl_ctx);
 	if (newcrt)  X509_free(newcrt);
+	EVP_PKEY_free(pkey);
 	return NULL;
 }
 

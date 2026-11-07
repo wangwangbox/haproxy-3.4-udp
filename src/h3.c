@@ -162,8 +162,8 @@ struct h3s {
 
 	enum h3s_t type;
 	enum h3s_st_req st_req; /* only used for request streams */
-	uint64_t demux_frame_len;
-	uint64_t demux_frame_type;
+	uint64_t demux_frame_len;  /* current parser frame remaining content to read */
+	uint64_t demux_frame_type; /* current parser frame type */
 
 	unsigned long long body_len; /* known request body length from content-length header if present */
 	unsigned long long data_len; /* total length of all parsed DATA */
@@ -298,18 +298,17 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 static ssize_t h3_parse_uni_stream_no_h3(struct qcs *qcs, struct buffer *b, int fin)
 {
 	struct h3s *h3s = qcs->ctx;
+	int ret = -1;
 
 	/* Function reserved to non-HTTP/3 unidirectional streams. */
 	BUG_ON(!quic_stream_is_uni(qcs->id) || !(h3s->flags & H3_SF_UNI_NO_H3));
 
 	switch (h3s->type) {
 	case H3S_T_QPACK_DEC:
-		if (qpack_decode_dec(b, fin, qcs))
-			return -1;
+		ret = qpack_decode_dec(b, fin, qcs);
 		break;
 	case H3S_T_QPACK_ENC:
-		if (qpack_decode_enc(b, fin, qcs))
-			return -1;
+		ret = qpack_decode_enc(b, fin, qcs);
 		break;
 	case H3S_T_UNKNOWN:
 	default:
@@ -317,8 +316,7 @@ static ssize_t h3_parse_uni_stream_no_h3(struct qcs *qcs, struct buffer *b, int 
 		ABORT_NOW();
 	}
 
-	/* TODO adjust return code */
-	return 0;
+	return ret;
 }
 
 /* Decode a H3 frame header from <rxbuf> buffer. The frame type is stored in
@@ -678,6 +676,15 @@ static ssize_t h3_req_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	 */
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+
+	if (!len) {
+		/* Reject empty frame as it lacks at least any mandatory pseudo-header. */
+		TRACE_ERROR("reject empty HEADERS frame", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		h3s->err = H3_ERR_MESSAGE_ERROR;
+		qcc_report_glitch(h3c->qcc, 1);
+		len = -1;
+		goto out;
+	}
 
 	/* TODO support trailer parsing in this function */
 
@@ -1169,6 +1176,15 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 
+	if (!len) {
+		/* Reject empty frame as it lacks at least any mandatory pseudo-header. */
+		TRACE_ERROR("reject empty HEADERS frame", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		h3s->err = H3_ERR_MESSAGE_ERROR;
+		qcc_report_glitch(h3c->qcc, 1);
+		len = -1;
+		goto out;
+	}
+
 	/* TODO support buffer wrapping */
 	BUG_ON(b_head(buf) + len > b_wrap(buf));
 	ret = qpack_decode_fs((const unsigned char *)b_head(buf), len, tmp,
@@ -1425,18 +1441,29 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 
-	/* TODO support buffer wrapping */
-	BUG_ON(b_head(buf) + len > b_wrap(buf));
-	ret = qpack_decode_fs((const unsigned char *)b_head(buf), len, tmp,
-	                    list, sizeof(list) / sizeof(list[0]));
-	if (ret < 0) {
-		TRACE_ERROR("QPACK decoding error", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
-		if ((qpack_err = qpack_err_decode(ret)) >= 0) {
-			h3c->err = qpack_err;
-			qcc_report_glitch(qcs->qcc, 1);
-		}
-		len = -1;
+	if (!len && !fin) {
+		/* Ignore empty frame to prevent unnecessary appbuf alloc. Not
+		 * performed though if FIN is set as HTX EOM must be reported.
+		 */
+		TRACE_STATE("skip parsing of empty HEADERS frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
 		goto out;
+	}
+
+	if (len) {
+		/* TODO support buffer wrapping */
+		BUG_ON(b_head(buf) + len > b_wrap(buf));
+
+		ret = qpack_decode_fs((const unsigned char *)b_head(buf), len,
+		                      tmp, list, sizeof(list) / sizeof(list[0]));
+		if (ret < 0) {
+			TRACE_ERROR("QPACK decoding error", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+			if ((qpack_err = qpack_err_decode(ret)) >= 0) {
+				h3c->err = qpack_err;
+				qcc_report_glitch(qcs->qcc, 1);
+			}
+			len = -1;
+			goto out;
+		}
 	}
 
 	if (!(appbuf = qcc_get_stream_rxbuf(qcs))) {
@@ -1461,6 +1488,20 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 			sl->flags |= HTX_SL_F_BODYLESS;
 		else
 			TRACE_ERROR("cannot notify missing body after trailers", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+	}
+
+	if (!len) {
+		/* Ensure EOM is reported when an empty frame is handled. */
+		if (!htx_set_eom(htx)) {
+			TRACE_ERROR("cannot set EOM", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+			qcc_set_error(qcs->qcc, H3_ERR_INTERNAL_ERROR, 1,
+			              muxc_tevt_type_internal_err);
+			len = -1;
+			goto out;
+		}
+
+		TRACE_STATE("EOM reported after empty frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+		goto out;
 	}
 
 	hdr_idx = 0;
@@ -1588,7 +1629,7 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 static ssize_t h3_data_to_htx(struct qcs *qcs, const struct buffer *buf,
                               uint64_t len, char fin)
 {
-	struct buffer *appbuf;
+	struct buffer *appbuf = NULL;
 	struct htx *htx = NULL;
 	size_t htx_sent = 0;
 	int htx_space;
@@ -1596,12 +1637,33 @@ static ssize_t h3_data_to_htx(struct qcs *qcs, const struct buffer *buf,
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
 
+	if (!len && !fin) {
+		/* Ignore empty frame to prevent unnecessary appbuf alloc. Not
+		 * performed though if FIN is set as HTX EOM must be reported.
+		 */
+		TRACE_STATE("skip parsing of empty DATA frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+		goto out;
+	}
+
 	if (!(appbuf = qcc_get_stream_rxbuf(qcs))) {
 		TRACE_ERROR("data buffer alloc failure", H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
 		goto err;
 	}
 
 	htx = htx_from_buf(appbuf);
+
+	if (!len) {
+		/* Ensure EOM is reported when an empty frame is handled. */
+		if (!htx_set_eom(htx)) {
+			TRACE_ERROR("cannot set EOM", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+			qcc_set_error(qcs->qcc, H3_ERR_INTERNAL_ERROR, 1,
+			              muxc_tevt_type_internal_err);
+			goto err;
+		}
+
+		TRACE_STATE("EOM reported after empty frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+		goto out;
+	}
 
 	if (len > b_data(buf)) {
 		len = b_data(buf);
@@ -1655,7 +1717,8 @@ static ssize_t h3_data_to_htx(struct qcs *qcs, const struct buffer *buf,
 	return -1;
 }
 
-/* Parse a SETTINGS frame of length <len> of payload <buf>.
+/* Parse a SETTINGS frame of length <len> and of payload <buf>. An empty frame
+ * is supported : this will leave the parameters to their default value.
  *
  * Returns the number of consumed bytes or a negative error code.
  */
@@ -1747,6 +1810,22 @@ static ssize_t h3_parse_goaway_frm(struct h3c *h3c, const struct buffer *buf,
 
 	b = b_make(b_orig(buf), b_size(buf), b_head_ofs(buf), len);
 	if (!b_quic_dec_int(&id, &b, &ret)) {
+		/* RFC 9114 7.1. Frame Layout
+		 *
+		 * Each frame's payload MUST contain exactly the fields identified in
+		 * its description. A frame payload that contains additional bytes after
+		 * the identified fields or a frame payload that terminates before the
+		 * end of the identified fields MUST be treated as a connection error of
+		 * type H3_FRAME_ERROR.
+		 */
+		TRACE_ERROR("truncated GOAWAY frame", H3_EV_RX_FRAME, h3c->qcc->conn);
+		h3c->err = H3_ERR_FRAME_ERROR;
+		qcc_report_glitch(h3c->qcc, 1);
+		return -1;
+	}
+
+	if (ret != len) {
+		TRACE_ERROR("mismatch on GOAWAY frame length", H3_EV_RX_FRAME, h3c->qcc->conn);
 		h3c->err = H3_ERR_FRAME_ERROR;
 		qcc_report_glitch(h3c->qcc, 1);
 		return -1;
@@ -1833,8 +1912,21 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 		goto err;
 	}
 
-	if (!b_data(b) && fin && quic_stream_is_bidi(qcs->id)) {
+	if (!b_data(b) && fin) {
 		TRACE_PROTO("received FIN without data", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+
+		/* RFC 9114 7.1. Frame Layout
+		 *
+		 * When a stream terminates cleanly, if the last frame on the stream was
+		 * truncated, this MUST be treated as a connection error of type
+		 * H3_FRAME_ERROR.
+		 */
+		if (h3s->demux_frame_len) {
+			TRACE_ERROR("truncated frame on FIN", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+			qcc_set_error(qcs->qcc, H3_ERR_FRAME_ERROR, 1, muxc_tevt_type_proto_err);
+			qcc_report_glitch(qcs->qcc, 1);
+			goto err;
+		}
 
 		/* FIN received, ensure body length is conform to any content-length header. */
 		if ((h3s->flags & H3_SF_HAVE_CLEN) && h3_check_body_size(qcs, 1)) {
@@ -1843,7 +1935,7 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 			goto done;
 		}
 
-		if (qcs_http_handle_standalone_fin(qcs)) {
+		if (quic_stream_is_bidi(qcs->id) && qcs_http_handle_standalone_fin(qcs)) {
 			TRACE_ERROR("cannot set EOM", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
 			qcc_set_error(qcs->qcc, H3_ERR_INTERNAL_ERROR, 1,
 			              muxc_tevt_type_internal_err);
@@ -1861,6 +1953,13 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 			/* Switch to a new frame. */
 			size_t hlen = h3_decode_frm_header(&ftype, &flen, b);
 			if (!hlen) {
+				if (fin) {
+					TRACE_ERROR("truncated H3 frame header", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+					qcc_set_error(qcs->qcc, H3_ERR_FRAME_ERROR, 1, muxc_tevt_type_proto_err);
+					qcc_report_glitch(qcs->qcc, 1);
+					goto err;
+				}
+
 				TRACE_PROTO("pause parsing on incomplete frame header", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
 				break;
 			}
@@ -1869,6 +1968,7 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 			h3s->demux_frame_len = flen;
 			total += hlen;
 			TRACE_PROTO("parsing a new frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+			h3_inc_frame_type_cnt(h3c->prx_counters, ftype);
 
 			if ((ret = h3_check_frame_valid(h3c, qcs, ftype))) {
 				TRACE_ERROR("received an invalid frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
@@ -1892,9 +1992,19 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 					qcs->sd->kip += flen;
 				}
 			}
+		}
 
-			if (!b_data(b))
-				break;
+		/* RFC 9114 7.1. Frame Layout
+		 *
+		 * When a stream terminates cleanly, if the last frame on the stream was
+		 * truncated, this MUST be treated as a connection error of type
+		 * H3_FRAME_ERROR.
+		 */
+		if (fin && h3s->demux_frame_len > b_data(b)) {
+			TRACE_ERROR("truncated frame on FIN", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+			qcc_set_error(qcs->qcc, H3_ERR_FRAME_ERROR, 1, muxc_tevt_type_proto_err);
+			qcc_report_glitch(qcs->qcc, 1);
+			goto err;
 		}
 
 		flen = h3s->demux_frame_len;
@@ -1941,7 +2051,6 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 		if (last_stream_frame && h3s->flags & H3_SF_HAVE_CLEN && h3_check_body_size(qcs, last_stream_frame))
 			break;
 
-		h3_inc_frame_type_cnt(h3c->prx_counters, ftype);
 		switch (ftype) {
 		case H3_FT_DATA:
 			ret = h3_data_to_htx(qcs, b, flen, last_stream_frame);
@@ -1981,6 +2090,21 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 			}
 			break;
 		case H3_FT_CANCEL_PUSH:
+			if (unlikely(!flen)) {
+				/* RFC 9114 7.1. Frame Layout
+				 *
+				 * Each frame's payload MUST contain exactly the fields identified in
+				 * its description. A frame payload that contains additional bytes after
+				 * the identified fields or a frame payload that terminates before the
+				 * end of the identified fields MUST be treated as a connection error of
+				 * type H3_FRAME_ERROR.
+				 */
+				TRACE_ERROR("truncated CANCEL_PUSH frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+				qcc_set_error(qcs->qcc, H3_ERR_FRAME_ERROR, 1, muxc_tevt_type_proto_err);
+				qcc_report_glitch(qcs->qcc, 1);
+				goto err;
+			}
+
 			if (!conn_is_back(qcs->qcc->conn)) {
 				/* RFC 9114 7.2.3. CANCEL_PUSH
 				 *
@@ -2020,6 +2144,21 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 			/* h3_check_frame_valid() must reject on server side. */
 			BUG_ON(!conn_is_back(qcs->qcc->conn));
 
+			if (unlikely(!flen)) {
+				/* RFC 9114 7.1. Frame Layout
+				 *
+				 * Each frame's payload MUST contain exactly the fields identified in
+				 * its description. A frame payload that contains additional bytes after
+				 * the identified fields or a frame payload that terminates before the
+				 * end of the identified fields MUST be treated as a connection error of
+				 * type H3_FRAME_ERROR.
+				 */
+				TRACE_ERROR("truncated PUSH_PROMISE frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+				qcc_set_error(qcs->qcc, H3_ERR_FRAME_ERROR, 1, muxc_tevt_type_proto_err);
+				qcc_report_glitch(qcs->qcc, 1);
+				goto err;
+			}
+
 			/* RFC 9114 7.2.5. PUSH_PROMISE
 			 *
 			 * A client MUST treat
@@ -2033,16 +2172,45 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 			/* h3_check_frame_valid() must reject on client side. */
 			BUG_ON(conn_is_back(qcs->qcc->conn));
 
+			if (unlikely(!flen)) {
+				/* RFC 9114 7.1. Frame Layout
+				 *
+				 * Each frame's payload MUST contain exactly the fields identified in
+				 * its description. A frame payload that contains additional bytes after
+				 * the identified fields or a frame payload that terminates before the
+				 * end of the identified fields MUST be treated as a connection error of
+				 * type H3_FRAME_ERROR.
+				 */
+				TRACE_ERROR("truncated MAX_PUSH_ID frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+				qcc_set_error(qcs->qcc, H3_ERR_FRAME_ERROR, 1, muxc_tevt_type_proto_err);
+				qcc_report_glitch(qcs->qcc, 1);
+				goto err;
+			}
+
 			/* Not supported. */
 			ret = flen;
 			break;
 		default:
-			/* RFC 9114 Section 9. Extensions to HTTP/3
-			 *
-			 * Implementations MUST discard frames [...] that have unknown
-			 * or unsupported types.
-			 */
-			ret = flen;
+			if (quic_stream_is_bidi(qcs->id) && last_stream_frame) {
+				/* No header seen, HTTP message is malformed. */
+				if (h3s->st_req == H3S_ST_REQ_BEFORE) {
+					TRACE_ERROR("malformed request closed by unknown frame without any header", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+					h3s->err = H3_ERR_MESSAGE_ERROR;
+					qcc_report_glitch(qcs->qcc, 1);
+					ret = -1;
+				}
+
+				/* Reuse wrapper function to easily set EOM on HTX message. */
+				if (qcs_http_handle_standalone_fin(qcs)) {
+					TRACE_ERROR("cannot set EOM", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+					qcc_set_error(qcs->qcc, H3_ERR_INTERNAL_ERROR, 1,
+					              muxc_tevt_type_internal_err);
+					goto err;
+				}
+			}
+
+			if (ret >= 0)
+				ret = flen;
 			break;
 		}
 
@@ -3168,6 +3336,13 @@ static int h3_close(struct qcs *qcs, enum qcc_app_ops_close_side side)
 	 */
 	if (qcs == h3c->ctrl_strm || h3s->type == H3S_T_CTRL) {
 		TRACE_ERROR("closure detected on control stream", H3_EV_H3S_END, qcs->qcc->conn, qcs);
+		qcc_set_error(qcs->qcc, H3_ERR_CLOSED_CRITICAL_STREAM, 1,
+		              muxc_tevt_type_proto_err);
+		qcc_report_glitch(qcs->qcc, 1);
+		return 1;
+	}
+	else if (h3s->type == H3S_T_QPACK_DEC || h3s->type == H3S_T_QPACK_ENC) {
+		TRACE_ERROR("closure detected on QPACK stream", H3_EV_H3S_END, qcs->qcc->conn, qcs);
 		qcc_set_error(qcs->qcc, H3_ERR_CLOSED_CRITICAL_STREAM, 1,
 		              muxc_tevt_type_proto_err);
 		qcc_report_glitch(qcs->qcc, 1);

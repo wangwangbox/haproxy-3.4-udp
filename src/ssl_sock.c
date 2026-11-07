@@ -51,6 +51,7 @@
 #include <haproxy/channel.h>
 #include <haproxy/chunk.h>
 #include <haproxy/cli.h>
+#include <haproxy/clock.h>
 #include <haproxy/connection.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/errors.h>
@@ -1750,6 +1751,50 @@ static void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
 				ctx->xprt_st |= SSL_SOCK_ST_FL_16K_WBFSIZE;
 			}
 		}
+
+#if defined(TLS1_3_VERSION) && !defined(USE_OPENSSL_WOLFSSL)
+	/* Reduce TLS1.3 session timeout so it doesn't reset at each new
+	 * resumed connection */
+
+		if (!(ctx->xprt_st & SSL_SOCK_SESS_TIMEOUT_SET) &&
+		    SSL_version(ssl) == TLS1_3_VERSION) {
+			SSL_SESSION *sess = SSL_get0_session(ssl);
+
+			if (sess) {
+				time_t now = date.tv_sec;
+#if HA_OPENSSL_VERSION_NUMBER >= 0x30400000L
+				time_t created = SSL_SESSION_get_time_ex(sess);
+#else
+				time_t created = SSL_SESSION_get_time(sess);
+#endif
+				long timeout = SSL_SESSION_get_timeout(sess);
+				long ctx_timeout = SSL_CTX_get_timeout(SSL_get_SSL_CTX(ssl));
+				long elapsed = now - created;
+				long remaining;
+
+				/* reduce the timeout if it was decreased in the configuration since the session creation */
+				if (ctx_timeout < timeout)
+					timeout = ctx_timeout;
+				if (elapsed < 0)
+					elapsed = 0;
+
+				remaining = timeout - elapsed;
+
+#if HA_OPENSSL_VERSION_NUMBER >= 0x30400000L
+				SSL_SESSION_set_time_ex(sess, now);
+#else
+				SSL_SESSION_set_time(sess, now);
+#endif
+				/* reset the timeout or remove the session */
+				if (remaining > 0)
+					SSL_SESSION_set_timeout(sess, remaining);
+				else
+					SSL_SESSION_set1_id_context(sess, (unsigned char *) "", 0);
+
+				ctx->xprt_st |= SSL_SOCK_SESS_TIMEOUT_SET;
+			}
+		}
+#endif
 	}
 }
 
@@ -1815,9 +1860,15 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 		 * reference right now. */
 		certs = X509_STORE_CTX_get1_chain(x_store);
 		if (certs) {
+			X509 *prev_crt = client_crt;
+
 			client_crt = sk_X509_value(certs, 0);
 			if (client_crt) {
 				X509_up_ref(client_crt);
+				/* release the reference possibly stored by a
+				 * previous call at another depth.
+				 */
+				X509_free(prev_crt);
 				SSL_set_ex_data(ssl, ssl_client_crt_ref_index, client_crt);
 			}
 			sk_X509_pop_free(certs, X509_free);
@@ -4107,14 +4158,16 @@ ssl_sock_initial_ctx(struct bind_conf *bind_conf)
 #ifdef USE_ECH
 	if (bind_conf->ssl_conf.ech_filedir) {
 		int loaded = 0;
+		char *ech_err = NULL;
 
-        if (load_echkeys(ctx, bind_conf->ssl_conf.ech_filedir, &loaded) != 1) {
-		    cfgerr += 1;
-		    ha_alert("Proxy '%s': failed to load ECH key s from %s for '%s' at [%s:%d].\n",
-			    bind_conf->frontend->id, bind_conf->ssl_conf.ech_filedir,
-                bind_conf->arg, bind_conf->file, bind_conf->line);
-        }
-    }
+		if (load_echkeys(ctx, bind_conf->ssl_conf.ech_filedir, &loaded, &ech_err) != 1) {
+			cfgerr += 1;
+			ha_alert("Proxy '%s': failed to load ECH keys from %s for '%s' at [%s:%d]: %s.\n",
+			         bind_conf->frontend->id, bind_conf->ssl_conf.ech_filedir,
+			         bind_conf->arg, bind_conf->file, bind_conf->line, ech_err);
+		}
+		ha_free(&ech_err);
+	}
 #endif
 
 	if (conf_ssl_methods->flags && (conf_ssl_methods->min || conf_ssl_methods->max))
@@ -4218,8 +4271,14 @@ ssl_sock_initial_ctx(struct bind_conf *bind_conf)
 		mode |= SSL_MODE_ASYNC;
 #endif
 	SSL_CTX_set_mode(ctx, mode);
-	if (global_ssl.life_time)
+	if (global_ssl.life_time) {
 		SSL_CTX_set_timeout(ctx, global_ssl.life_time);
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+		/* SSL_CTX_set_timeout() above only covers TLS1.2 and below on
+		 * these libs, TLS1.3 has its own separate "psk_dhe" lifetime */
+		SSL_CTX_set_session_psk_dhe_timeout(ctx, global_ssl.life_time);
+#endif
+	}
 
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 # if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
@@ -4458,9 +4517,6 @@ static int sh_ssl_sess_new_cb(SSL *ssl, SSL_SESSION *sess)
 	/* force length to zero to avoid ASN1 encoding */
 	SSL_SESSION_set1_id(sess, encid, 0);
 
-	/* force length to zero to avoid ASN1 encoding */
-	SSL_SESSION_set1_id_context(sess, (const unsigned char *)SHCTX_APPNAME, 0);
-
 	/* check if buffer is large enough for the ASN1 encoded session */
 	data_len = i2d_SSL_SESSION(sess, NULL);
 	if (data_len > SHSESS_MAX_DATA_LEN)
@@ -4477,7 +4533,6 @@ static int sh_ssl_sess_new_cb(SSL *ssl, SSL_SESSION *sess)
 err:
 	/* reset original length values */
 	SSL_SESSION_set1_id(sess, encid, sid_length);
-	SSL_SESSION_set1_id_context(sess, (const unsigned char *)SHCTX_APPNAME, strlen(SHCTX_APPNAME));
 
 	return 0; /* do not increment session reference count */
 }
@@ -4525,11 +4580,9 @@ static SSL_SESSION *sh_ssl_sess_get_cb(SSL *ssl, __OPENSSL_110_CONST__ unsigned 
 	/* decode ASN1 session */
 	p = data;
 	sess = d2i_SSL_SESSION(NULL, (const unsigned char **)&p, first->len-sizeof(struct sh_ssl_sess_hdr));
-	/* Reset session id and session id contenxt */
-	if (sess) {
+	/* Restore the session ID but preserve its original security context. */
+	if (sess)
 		SSL_SESSION_set1_id(sess, key, key_len);
-		SSL_SESSION_set1_id_context(sess, (const unsigned char *)SHCTX_APPNAME, strlen(SHCTX_APPNAME));
-	}
 
 	return sess;
 }
@@ -4564,6 +4617,185 @@ static void sh_ssl_sess_remove_cb(SSL_CTX *ctx, SSL_SESSION *sess)
 	/* unlock cache */
 	shctx_wrunlock(ssl_shctx);
 }
+
+#ifndef USE_OPENSSL_WOLFSSL
+
+/* hash the Issuer, Subject and Serial of a certificate
+ * mdctx: EVP crypto context
+ * cert: X509 to hash
+ */
+static int ssl_ctx_hash_X509(EVP_MD_CTX *mdctx, X509 *cert)
+{
+	ASN1_INTEGER *serial;
+	const unsigned char *serial_data;
+	int serial_len;
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int digest_len = 0;
+
+	if (!cert)
+		/* No certificate, probably initial ctx, ignore */
+		return 1;
+
+	/* Hash the Issuer and the Subject */
+	if (X509_NAME_digest(X509_get_issuer_name(cert), EVP_sha256(), digest, &digest_len) != 1)
+		return 0;
+	if (EVP_DigestUpdate(mdctx, digest, digest_len) != 1)
+		return 0;
+
+	if (X509_NAME_digest(X509_get_subject_name(cert), EVP_sha256(), digest, &digest_len) != 1)
+		return 0;
+	if (EVP_DigestUpdate(mdctx, digest, digest_len) != 1)
+		return 0;
+
+	/* Hash the Serial */
+	serial = X509_get_serialNumber(cert);
+	if (!serial)
+		return 0;
+
+	serial_data = ASN1_STRING_get0_data(serial);
+	serial_len = ASN1_STRING_length(serial);
+
+	if (EVP_DigestUpdate(mdctx, serial_data, serial_len) != 1)
+		return 0;
+
+	return 1;
+}
+
+/* hash SNI filters into the session ID context */
+static int ssl_ctx_hash_filters(EVP_MD_CTX *mdctx, char **filters, unsigned int fcount)
+{
+	unsigned int i;
+
+	if (EVP_DigestUpdate(mdctx, &fcount, sizeof(fcount)) != 1)
+		return 0;
+
+	for (i = 0; i < fcount; i++) {
+		size_t len = strlen(filters[i]);
+
+		/* hash the len to avoid collision like "ab""c" = "abc" */
+		if (EVP_DigestUpdate(mdctx, &len, sizeof(len)) != 1)
+			return 0;
+		if (len && EVP_DigestUpdate(mdctx, filters[i], len) != 1)
+			return 0;
+	}
+
+	return 1;
+}
+
+/* hash the trusted store of the SSL_CTX (X509 + CRL) */
+static int ssl_ctx_hash_store(EVP_MD_CTX *mdctx, SSL_CTX *ctx)
+{
+	STACK_OF(X509_OBJECT) *objects;
+	int count;
+	int i;
+	int ret = 0;
+
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x40000000L) && !defined(OPENSSL_IS_AWSLC) && \
+    !defined(LIBRESSL_VERSION_NUMBER)
+	objects = X509_STORE_get1_objects(SSL_CTX_get_cert_store(ctx));
+#else
+	objects = X509_STORE_get0_objects(SSL_CTX_get_cert_store(ctx));
+#endif
+	if (!objects)
+		return 0;
+
+	count = sk_X509_OBJECT_num(objects);
+	if (EVP_DigestUpdate(mdctx, &count, sizeof(count)) != 1)
+		goto out;
+
+	for (i = 0; i < count; i++) {
+		X509_OBJECT *object = sk_X509_OBJECT_value(objects, i);
+		int type = X509_OBJECT_get_type(object);
+		unsigned char digest[EVP_MAX_MD_SIZE];
+		unsigned int digest_len = 0;
+
+		if (EVP_DigestUpdate(mdctx, &type, sizeof(type)) != 1)
+			goto out;
+
+		switch (type) {
+		case X509_LU_X509:
+			if (!ssl_ctx_hash_X509(mdctx, X509_OBJECT_get0_X509(object)))
+				goto out;
+			break;
+		case X509_LU_CRL: {
+			X509_CRL *crl = X509_OBJECT_get0_X509_CRL(object);
+			ASN1_INTEGER *crl_number;
+			int crl_number_len;
+
+			if (!crl)
+				goto out;
+
+			if (X509_NAME_digest(X509_CRL_get_issuer(crl), EVP_sha256(), digest, &digest_len) != 1)
+				goto out;
+			if (EVP_DigestUpdate(mdctx, digest, digest_len) != 1)
+				goto out;
+
+			crl_number = X509_CRL_get_ext_d2i(crl, NID_crl_number, NULL, NULL);
+			crl_number_len = crl_number ? ASN1_STRING_length(crl_number) : 0;
+
+			if (EVP_DigestUpdate(mdctx, &crl_number_len, sizeof(crl_number_len)) != 1) {
+				ASN1_INTEGER_free(crl_number);
+				goto out;
+			}
+			if (crl_number_len && EVP_DigestUpdate(mdctx, ASN1_STRING_get0_data(crl_number), crl_number_len) != 1) {
+				ASN1_INTEGER_free(crl_number);
+				goto out;
+			}
+			ASN1_INTEGER_free(crl_number);
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	ret = 1;
+
+out:
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x40000000L) && !defined(OPENSSL_IS_AWSLC) && \
+    !defined(LIBRESSL_VERSION_NUMBER)
+	sk_X509_OBJECT_pop_free(objects, X509_OBJECT_free);
+#endif
+	return ret;
+}
+
+/* Replace the sid_ctx of a SSL_CTX */
+static int ssl_set_session_id_context(SSL_CTX *ctx,
+                                       const struct bind_conf *bind_conf,
+                                       const struct ssl_bind_conf *ssl_conf,
+                                       int verify,
+                                       struct ckch_inst *ckch_inst)
+{
+	EVP_MD_CTX *mdctx = NULL;
+	unsigned char sid_ctx[EVP_MAX_MD_SIZE];
+	unsigned int sid_ctx_len = 0;
+	struct crtlist_entry *entry = ckch_inst ? ckch_inst->crtlist_entry : NULL;
+	int ret = 0;
+
+	mdctx = EVP_MD_CTX_new();
+	if (!mdctx ||
+	    EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) != 1 ||
+	    EVP_DigestUpdate(mdctx, SHCTX_APPNAME, sizeof(SHCTX_APPNAME)) != 1 ||
+	    !ssl_ctx_hash_X509(mdctx, SSL_CTX_get0_certificate(ctx)) ||
+	    !ssl_ctx_hash_filters(mdctx, entry ? entry->filters : NULL, entry ? entry->fcount : 0) ||
+	    EVP_DigestUpdate(mdctx, &verify, sizeof(verify)) != 1 ||
+	    !ssl_ctx_hash_store(mdctx, ctx) ||
+	    EVP_DigestUpdate(mdctx, bind_conf->ca_ignerr_bitfield,
+	                     sizeof(bind_conf->ca_ignerr_bitfield)) != 1 ||
+	    EVP_DigestUpdate(mdctx, bind_conf->crt_ignerr_bitfield,
+	                     sizeof(bind_conf->crt_ignerr_bitfield)) != 1 ||
+	    EVP_DigestFinal_ex(mdctx, sid_ctx, &sid_ctx_len) != 1 ||
+	    sid_ctx_len > SSL_MAX_SID_CTX_LENGTH ||
+	    SSL_CTX_set_session_id_context(ctx, sid_ctx, sid_ctx_len) != 1)
+		goto out;
+
+	ret = 1;
+
+out:
+	EVP_MD_CTX_free(mdctx);
+	return ret;
+}
+#endif /* !USE_OPENSSL_WOLFSSL */
 
 /* Set session cache mode to server and disable openssl internal cache.
  * Set shared cache callbacks on an ssl context.
@@ -4676,7 +4908,8 @@ error:
  * This function applies the SSL configuration on a SSL_CTX
  * It returns an error code and fills the <err> buffer
  */
-static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_conf *ssl_conf, SSL_CTX *ctx, char **err)
+static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_conf *ssl_conf, SSL_CTX *ctx,
+                                 struct ckch_inst *ckch_inst, char **err)
 {
 	struct proxy *curproxy = bind_conf->frontend;
 	int cfgerr = 0;
@@ -4793,6 +5026,13 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 #endif
 
 	ssl_set_shctx(ctx);
+#ifndef USE_OPENSSL_WOLFSSL
+	if (!ssl_set_session_id_context(ctx, bind_conf, ssl_conf, verify, ckch_inst)) {
+		memprintf(err, "%sProxy '%s': unable to set the SSL session context for bind '%s' at [%s:%d].\n",
+		          err && *err ? *err : "", bind_conf->frontend->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+		cfgerr |= ERR_ALERT | ERR_FATAL;
+	}
+#endif /* !USE_OPENSSL_WOLFSSL */
 	conf_ciphers = (ssl_conf && ssl_conf->ciphers) ? ssl_conf->ciphers : bind_conf->ssl_conf.ciphers;
 	if (conf_ciphers &&
 	    !SSL_CTX_set_cipher_list(ctx, conf_ciphers)) {
@@ -4941,7 +5181,7 @@ int ssl_sock_prep_ctx_and_inst(struct bind_conf *bind_conf, struct ssl_bind_conf
 {
 	int errcode = 0;
 
-	errcode |= ssl_sock_prepare_ctx(bind_conf, ssl_conf, ctx, err);
+	errcode |= ssl_sock_prepare_ctx(bind_conf, ssl_conf, ctx, ckch_inst, err);
 	if (!errcode && ckch_inst)
 		ckch_inst_add_cafile_link(ckch_inst, bind_conf, ssl_conf, NULL);
 
@@ -5018,6 +5258,7 @@ static int ssl_sock_srv_verifycbk(int ok, X509_STORE_CTX *ctx)
 	int i;
 	__X509_NAME_CONST__ X509_NAME *cert_subject;
 	char *str;
+	int len;
 
 	if (ok == 0)
 		return ok;
@@ -5067,11 +5308,17 @@ static int ssl_sock_srv_verifycbk(int ok, X509_STORE_CTX *ctx)
 			GENERAL_NAME *name = sk_GENERAL_NAME_value(alt_names, i);
 			if (name->type == GEN_DNS) {
 #if HA_OPENSSL_VERSION_NUMBER < 0x00907000L
-				if (ASN1_STRING_to_UTF8((unsigned char **)&str, name->d.ia5) >= 0) {
+				if ((len = ASN1_STRING_to_UTF8((unsigned char **)&str, name->d.ia5)) >= 0) {
 #else
-				if (ASN1_STRING_to_UTF8((unsigned char **)&str, name->d.dNSName) >= 0) {
+				if ((len = ASN1_STRING_to_UTF8((unsigned char **)&str, name->d.dNSName)) >= 0) {
 #endif
-					ok = ssl_sock_srv_hostcheck(str, servername);
+					/* the hostname matcher works on a NUL
+					 * terminated string, so a name carrying
+					 * an embedded NUL must be rejected or it
+					 * would match its truncated form.
+					 */
+					if (strlen(str) == len)
+						ok = ssl_sock_srv_hostcheck(str, servername);
 					OPENSSL_free(str);
 				}
 			}
@@ -5085,8 +5332,10 @@ static int ssl_sock_srv_verifycbk(int ok, X509_STORE_CTX *ctx)
 		__X509_NAME_CONST__ X509_NAME_ENTRY *entry = X509_NAME_get_entry(cert_subject, i);
 		__X509_NAME_CONST__ ASN1_STRING *value;
 		value = X509_NAME_ENTRY_get_data(entry);
-		if (ASN1_STRING_to_UTF8((unsigned char **)&str, value) >= 0) {
-			ok = ssl_sock_srv_hostcheck(str, servername);
+		if ((len = ASN1_STRING_to_UTF8((unsigned char **)&str, value)) >= 0) {
+			/* see above about embedded NULs */
+			if (strlen(str) == len)
+				ok = ssl_sock_srv_hostcheck(str, servername);
 			OPENSSL_free(str);
 		}
 	}
@@ -5570,12 +5819,15 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 		struct sni_ctx *sni_ctx;
 
 		/* if we use the generate-certificates option, look for the first default cert available */
+		HA_RWLOCK_RDLOCK(SNI_LOCK, &bind_conf->sni_lock);
 		sni_ctx = ssl_sock_choose_sni_ctx(bind_conf, NULL, "", 1, 1);
 		if (!sni_ctx) {
+			HA_RWLOCK_RDUNLOCK(SNI_LOCK, &bind_conf->sni_lock);
 			ha_alert("Proxy '%s': no SSL certificate specified for bind '%s' and 'generate-certificates' option at [%s:%d] (use 'crt').\n",
 				 px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
 			return -1;
 		}
+		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &bind_conf->sni_lock);
 	}
 
 	if (!ssl_shctx && global.tune.sslcachesize) {
@@ -7111,8 +7363,10 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 				if (ret < 0)
 					closed_connection = 1;
 			}
-			if (closed_connection)
+			if (closed_connection) {
+				conn = NULL;
 				t = NULL;
+			}
 			goto leave;
 		}
 	}
@@ -7139,6 +7393,7 @@ leave:
 				if (!session_reinsert_idle_conn(conn->owner, conn)) {
 					/* session add conn failure */
 					CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
+					conn = NULL;
 					t = NULL;
 				}
 			}
@@ -7151,6 +7406,7 @@ leave:
 		else {
 			/* Do not store an idle conn if server in maintenance. */
 			CALL_MUX_NO_RET(conn->mux, destroy(conn->ctx));
+			conn = NULL;
 			t = NULL;
 		}
 	}
@@ -7351,7 +7607,8 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 		}
 	}
  leave:
-	ctx->flags &= ~SSL_SOCK_F_KTLS_RX_CTRL;
+	if (ctx)
+		ctx->flags &= ~SSL_SOCK_F_KTLS_RX_CTRL;
 	TRACE_LEAVE(SSL_EV_CONN_RECV, conn);
 	return done;
 

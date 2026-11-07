@@ -194,6 +194,7 @@ int ssl_sock_get_dn_entry(__X509_NAME_CONST__ X509_NAME *a, const struct buffer 
 	__X509_NAME_CONST__ ASN1_OBJECT *obj;
 	__X509_NAME_CONST__ ASN1_STRING *data;
 	const unsigned char *data_ptr;
+	const unsigned char *nul;
 	int data_len;
 	int i, j, n;
 	int cur = 0;
@@ -234,6 +235,21 @@ int ssl_sock_get_dn_entry(__X509_NAME_CONST__ X509_NAME *a, const struct buffer 
 
 		if (data_len > out->size)
 			return -1;
+
+		/* reject embedded NUL (truncation/injection risk for NUL-terminated
+		 * consumers); trailing NUL(s) carry nothing after them so they're
+		 * harmless padding, just keep one and skip the extra ones
+		 */
+		nul = memchr(data_ptr, 0, data_len);
+		if (nul) {
+			const unsigned char *p;
+
+			for (p = nul; p < data_ptr + data_len; p++) {
+				if (*p)
+					return 0;
+			}
+			data_len = nul - data_ptr + 1;
+		}
 
 		memcpy(out->area, data_ptr, data_len);
 		out->data = data_len;
@@ -285,6 +301,7 @@ int ssl_sock_get_dn_oneline(__X509_NAME_CONST__ X509_NAME *a, struct buffer *out
 	__X509_NAME_CONST__ ASN1_OBJECT *obj;
 	__X509_NAME_CONST__ ASN1_STRING *data;
 	const unsigned char *data_ptr;
+	const unsigned char *nul;
 	int data_len;
 	int i, n, ln;
 	int l = 0;
@@ -304,6 +321,23 @@ int ssl_sock_get_dn_oneline(__X509_NAME_CONST__ X509_NAME *a, struct buffer *out
 		data = X509_NAME_ENTRY_get_data(ne);
 		data_ptr = ASN1_STRING_get0_data(data);
 		data_len = ASN1_STRING_length(data);
+
+		/* reject the whole DN if this entry carries an embedded NUL
+		 * (truncation/injection risk for NUL-terminated consumers);
+		 * trailing NUL(s) carry nothing after them so they're harmless
+		 * padding, just keep one and skip the extra ones
+		 */
+		nul = memchr(data_ptr, 0, data_len);
+		if (nul) {
+			const unsigned char *q;
+
+			for (q = nul; q < data_ptr + data_len; q++) {
+				if (*q)
+					return 0;
+			}
+			data_len = nul - data_ptr + 1;
+		}
+
 		n = OBJ_obj2nid(obj);
 		if ((n == NID_undef) || ((s = OBJ_nid2sn(n)) == NULL)) {
 			i2t_ASN1_OBJECT(tmp, sizeof(tmp), obj);
@@ -1016,8 +1050,8 @@ static struct curve {
 	V( 26,     NID_brainpoolP256r1,                      "brainpoolP256r1",       NULL       ),
 	V( 27,     NID_brainpoolP384r1,                      "brainpoolP384r1",       NULL       ),
 	V( 28,     NID_brainpoolP512r1,                      "brainpoolP512r1",       NULL       ),
-	V( 29,     NID_X25519,                               "ecdh_x25519",           NULL       ),
-	V( 30,     NID_X448,                                 "ecdh_x448",             NULL       ),
+	V( 29,     NID_X25519,                               "x25519",                NULL       ),
+	V( 30,     NID_X448,                                 "x448",                  NULL       ),
 	V( 31,     NID_brainpoolP256r1tls13,                 "brainpoolP256r1tls13",  NULL       ),
 	V( 32,     NID_brainpoolP384r1tls13,                 "brainpoolP384r1tls13",  NULL       ),
 	V( 33,     NID_brainpoolP512r1tls13,                 "brainpoolP512r1tls13",  NULL       ),
@@ -1042,6 +1076,12 @@ static struct curve {
 	V( 25498,  -1,                                       "SecP256r1Kyber768Draft00",        NULL ),
 	V( 0xFF01, -1,                                       "arbitrary_explicit_prime_curves", NULL ),
 	V( 0xFF02, -1,                                       "arbitrary_explicit_char2_curves", NULL ),
+	/* Keep the old OpenSSL trace labels as aliases for name-to-NID lookup.
+	 * These must follow the standard names above, since curveid2str()
+	 * returns the first entry matching the TLS group identifier.
+	 */
+	V( 29,     NID_X25519,                               "ecdh_x25519",           NULL       ),
+	V( 30,     NID_X448,                                 "ecdh_x448",             NULL       ),
 	{ 0, 0, NULL, NULL, NULL }
 };
 

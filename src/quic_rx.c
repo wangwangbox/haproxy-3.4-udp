@@ -146,13 +146,11 @@ static int qc_pkt_decrypt(struct quic_conn *qc, struct quic_enc_level *qel,
 		 */
 		if (!(*pkt->data & QUIC_PACKET_KEY_PHASE_BIT) ^ !(tls_ctx->flags & QUIC_FL_TLS_KP_BIT_SET)) {
 			if (pkt->pn < tls_ctx->rx.pn) {
-				/* The lowest packet number of a previous key phase
-				 * cannot be null if it really stores previous key phase
-				 * secrets.
+				/* The previous key phase secrets are only
+				 * available after a first key update.
 				 */
-				// TODO: check if BUG_ON() more suitable
-				if (!qc->ku.prv_rx.pn) {
-					TRACE_ERROR("null previous packet number", QUIC_EV_CONN_RXPKT, qc);
+				if (!qc->ku.prv_rx.ctx) {
+					TRACE_ERROR("no previous key phase secrets", QUIC_EV_CONN_RXPKT, qc);
 					goto leave;
 				}
 
@@ -163,6 +161,16 @@ static int qc_pkt_decrypt(struct quic_conn *qc, struct quic_enc_level *qel,
 			else if (pkt->pn > qel->pktns->rx.largest_pn) {
 				/* Next key phase */
 				TRACE_PROTO("Key phase changed", QUIC_EV_CONN_RXPKT, qc);
+
+				/* The next keys may be missing if a previous
+				 * update failed. Derive them again.
+				 */
+				if ((!qc->ku.nxt_rx.ctx || !qc->ku.nxt_tx.ctx) &&
+				    !quic_tls_key_update(qc)) {
+					TRACE_ERROR("quic_tls_key_update() failed", QUIC_EV_CONN_RXPKT, qc);
+					goto leave;
+				}
+
 				kp_changed = 1;
 				rx_ctx = qc->ku.nxt_rx.ctx;
 				rx_iv  = qc->ku.nxt_rx.iv;
@@ -178,6 +186,21 @@ static int qc_pkt_decrypt(struct quic_conn *qc, struct quic_enc_level *qel,
 	                       rx_ctx, tls_ctx->rx.aead, rx_key, iv);
 	if (!ret) {
 		TRACE_ERROR("quic_tls_decrypt() failed", QUIC_EV_CONN_RXPKT, qc);
+
+		/* RFC 9001 6.6. Limits on AEAD Usage
+		 *
+		 * If the total number of received packets that fail
+		 * authentication within the connection, across all keys,
+		 * exceeds the integrity limit for the selected AEAD, the
+		 * endpoint MUST immediately close the connection with a
+		 * connection error of type AEAD_LIMIT_REACHED and not process
+		 * any more packets.
+		 */
+		if (++qc->rx.auth_fails > quic_aead_integrity_limit(tls_ctx->rx.aead)) {
+			TRACE_ERROR("AEAD integrity limit reached", QUIC_EV_CONN_RXPKT, qc);
+			quic_set_connection_close(qc, quic_err_transport(QC_ERR_AEAD_LIMIT_REACHED));
+		}
+
 		goto leave;
 	}
 
@@ -188,11 +211,11 @@ static int qc_pkt_decrypt(struct quic_conn *qc, struct quic_enc_level *qel,
 		tls_ctx->flags ^= QUIC_FL_TLS_KP_BIT_SET;
 		/* Store the lowest packet number received for the current key phase */
 		tls_ctx->rx.pn = pkt->pn;
-		/* Prepare the next key update */
-		if (!quic_tls_key_update(qc)) {
+		/* Prepare the next key update. On failure, the keys are
+		 * derived again at the next key phase change.
+		 */
+		if (!quic_tls_key_update(qc))
 			TRACE_ERROR("quic_tls_key_update() failed", QUIC_EV_CONN_RXPKT, qc);
-			goto leave;
-		}
 	}
 
 	/* Update the packet length (required to parse the frames). */
@@ -669,6 +692,7 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 	struct quic_cstream *cstream = qel->cstream;
 	struct ncbmbuf *ncbuf = &qel->cstream->rx.ncbuf;
 	uint64_t off_rel;
+	ncb_sz_t data;
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSHPKT, qc);
 
@@ -718,8 +742,22 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 	                    crypto_frm->len, NCB_ADD_OVERWRT);
 	BUG_ON(ncb_ret != NCB_RET_OK);
 
+	data = ncbmb_data(ncbuf, 0);
 	/* Reschedule with TASK_HEAVY if CRYPTO data ready for decoding. */
-	if (ncbmb_data(ncbuf, 0)) {
+	if (data) {
+		/* Reject CRYPTO content in case of wrapping. This ensures
+		 * there is no read of out-of-bound read by the SSL stack in
+		 * ha_quic_ossl_crypto_recv_rcd()/qc_ssl_provide_all_quic_data().
+		 * TODO implement proper support for CRYPTO wrapping.
+		 */
+		if (ncbmb_head(ncbuf) + data >= ncbmb_wrap(ncbuf)) {
+			TRACE_ERROR("unsupported wrapping CRYPTO frames", QUIC_EV_CONN_PRSHPKT, qc);
+			COUNT_IF(1, "connection closed on unsupported wrapping CRYPTO content");
+			quic_set_connection_close(qc, quic_err_transport(QC_ERR_CRYPTO_BUFFER_EXCEEDED));
+			quic_free_ncbuf(ncbuf);
+			goto err;
+		}
+
 		HA_ATOMIC_OR(&qc->wait_event.tasklet->state, TASK_HEAVY);
 		tasklet_wakeup(qc->wait_event.tasklet);
 	}
@@ -2045,6 +2083,19 @@ static int quic_rx_pkt_parse(struct quic_conn *qc, struct quic_rx_packet *pkt,
 				TRACE_PROTO("Packet dropped",
 				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
 				goto drop;
+			}
+
+			/* RFC 9000 17.2.5.2. Handling a Retry Packet
+			 *
+			 * A client MUST accept and process at most one Retry packet for each
+			 * connection attempt. After the client has received and processed an
+			 * Initial or Retry packet from the server, it MUST discard any
+			 * subsequent Retry packets that it receives.
+			 */
+			if (qc->retry_token) {
+				TRACE_PROTO("Drop duplicate Retry packet",
+				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+				goto drop_silent;
 			}
 
 			if (!quic_retry_packet_check(qc, pkt, beg, end, pos, &qc->retry_token_len))

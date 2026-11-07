@@ -507,6 +507,9 @@ static int ha_quic_ossl_crypto_recv_rcd(SSL *ssl,
 		BUG_ON(ncbmb_is_null(ncbuf) || !cstream);
 		/* <ncbuf> must not be released at this time. */
 		cdata = (const unsigned char *)ncbmb_head(ncbuf);
+		/* Currently wrapping CRYPTO content is not supported and rejected on frame reception. */
+		BUG_ON(cdata + data >= (const unsigned char *)ncbmb_wrap(ncbuf));
+
 		cstream->rx.offset += data;
 		TRACE_DEVEL("buffered crypto data were provided to TLS stack",
 					QUIC_EV_CONN_PHPKTS, qc, qel);
@@ -817,13 +820,15 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 #ifdef USE_ECH
 	if (bind_conf->ssl_conf.ech_filedir) {
 		int loaded = 0;
+		char *ech_err = NULL;
 
-		if (load_echkeys(ctx, bind_conf->ssl_conf.ech_filedir, &loaded) != 1) {
+		if (load_echkeys(ctx, bind_conf->ssl_conf.ech_filedir, &loaded, &ech_err) != 1) {
 			cfgerr += 1;
-			ha_alert("Proxy '%s': failed to load ECH key s from %s for '%s' at [%s:%d].\n",
+			ha_alert("Proxy '%s': failed to load ECH keys from %s for '%s' at [%s:%d]: %s.\n",
 			         bind_conf->frontend->id, bind_conf->ssl_conf.ech_filedir,
-			         bind_conf->arg, bind_conf->file, bind_conf->line);
+			         bind_conf->arg, bind_conf->file, bind_conf->line, ech_err);
 		}
+		ha_free(&ech_err);
 	}
 #endif
 
@@ -1185,6 +1190,8 @@ int qc_ssl_provide_all_quic_data(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
 		/* TODO not working if buffer is wrapping */
 		while ((data = ncbmb_data(ncbuf, 0))) {
 			const unsigned char *cdata = (const unsigned char *)ncbmb_head(ncbuf);
+			/* Currently wrapping CRYPTO content is not supported and rejected on frame reception. */
+			BUG_ON(cdata + data >= (const unsigned char *)ncbmb_wrap(ncbuf));
 
 			if (!qc_ssl_provide_quic_data(&qel->cstream->rx.ncbuf, qel->level,
 			                              ctx, cdata, data))

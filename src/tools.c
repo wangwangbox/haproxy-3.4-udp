@@ -2199,8 +2199,9 @@ int chunk_escape_string(struct buffer *chunk, const char *str, size_t len)
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_uint64_prefix(struct cbor_encode_ctx *ctx,
                                 char *start, char *stop, uint64_t value,
@@ -2261,8 +2262,9 @@ char *cbor_encode_uint64_prefix(struct cbor_encode_ctx *ctx,
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_int64(struct cbor_encode_ctx *ctx,
                         char *start, char *stop, int64_t value)
@@ -2292,8 +2294,9 @@ char *cbor_encode_int64(struct cbor_encode_ctx *ctx,
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_bytes_prefix(struct cbor_encode_ctx *ctx,
                                char *start, char *stop,
@@ -2325,8 +2328,9 @@ char *cbor_encode_bytes_prefix(struct cbor_encode_ctx *ctx,
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_text(struct cbor_encode_ctx *ctx,
                        char *start, char *stop,
@@ -2342,8 +2346,9 @@ char *cbor_encode_text(struct cbor_encode_ctx *ctx,
  *
  * CBOR encode ctx is provided in <ctx>
  *
- * Returns the position of the last written byte on success and NULL on
- * error. The function cannot write past <stop>
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. The function cannot write past <stop>.
+ * It will not append terminating NULL byte.
  */
 char *cbor_encode_bytes(struct cbor_encode_ctx *ctx,
                         char *start, char *stop,
@@ -2469,7 +2474,11 @@ int url_decode(char *string, int in_form)
 		case '%' :
 			if (!ishex(in[1]) || !ishex(in[2]))
 				goto end;
-			*out++ = (hex2i(in[1]) << 4) + hex2i(in[2]);
+			*out = (hex2i(in[1]) << 4) + hex2i(in[2]);
+			/* forbid %00 which cannot be represented in a string */
+			if (!*out)
+				goto end;
+			out++;
 			in += 2;
 			break;
 		case '?':
@@ -3901,6 +3910,72 @@ size_t ipaddrcpy(unsigned char *buf, const struct sockaddr_storage *saddr)
 	return p - buf;
 }
 
+/* cache of conversions from time_t to struct tm via localtime() and gmtime(). */
+static THREAD_LOCAL struct {
+	time_t sec;
+	struct tm tm;
+} localtime_cache[TIME_CACHE_SLOTS], gmtime_cache[TIME_CACHE_SLOTS];
+
+/* slot where most recent value was stored */
+static THREAD_LOCAL uint localtime_cache_slot, gmtime_cache_slot;
+
+/* This function converts the time_t value <now> into a broken out struct tm
+ * which must be allocated by the caller. It is highly recommended to use this
+ * function instead of localtime() because that one requires a time_t* which
+ * is not always compatible with tv_sec depending on OS/hardware combinations.
+ * Also it implements a cache that avoids internal libc contention on tz_lock
+ * when entering __tz_convert().
+ */
+void get_localtime(const time_t now, struct tm *tm)
+{
+	uint32_t idx;
+
+	/* visit recent entries in age order */
+	idx = localtime_cache_slot;
+	do {
+		if (likely(localtime_cache[idx].sec == now)) {
+			/* that's a hit, return the cached entry */
+			*tm = localtime_cache[idx].tm;
+			return;
+		}
+		idx = (idx - 1) % TIME_CACHE_SLOTS;
+	} while (idx != localtime_cache_slot);
+
+	/* that's a miss, convert the time and cache it */
+	localtime_r(&now, tm);
+	localtime_cache_slot = (localtime_cache_slot + 1) % TIME_CACHE_SLOTS;
+	localtime_cache[localtime_cache_slot].sec = now;
+	localtime_cache[localtime_cache_slot].tm = *tm;
+}
+
+/* This function converts the time_t value <now> into a broken out struct tm
+ * which must be allocated by the caller. It is highly recommended to use this
+ * function instead of gmtime() because that one requires a time_t* which
+ * is not always compatible with tv_sec depending on OS/hardware combinations.
+ * Also it implements a cache that avoids internal libc contention on tz_lock
+ * when entering __tz_convert().
+ */
+void get_gmtime(const time_t now, struct tm *tm)
+{
+	uint32_t idx;
+
+	/* visit recent entries in age order */
+	idx = gmtime_cache_slot;
+	do {
+		if (likely(gmtime_cache[idx].sec == now)) {
+			/* that's a hit, return the cached entry */
+			*tm = gmtime_cache[idx].tm;
+			return;
+		}
+		idx = (idx - 1) % TIME_CACHE_SLOTS;
+	} while (idx != gmtime_cache_slot);
+
+	/* that's a miss, convert the time and cache it */
+	gmtime_r(&now, tm);
+	gmtime_cache_slot = (gmtime_cache_slot + 1) % TIME_CACHE_SLOTS;
+	gmtime_cache[gmtime_cache_slot].sec = now;
+	gmtime_cache[gmtime_cache_slot].tm = *tm;
+}
 
 char *human_time(int t, short hz_div) {
 	static char rv[sizeof("24855d23h")+1];	// longest of "23h59m" and "59m59s"
@@ -7168,7 +7243,7 @@ const char *hash_anon(uint32_t scramble, const char *string2hash, const char *pr
 		index_hash = 0;
 
 	/* don't hash empty strings */
-	if (!string2hash[0] || (string2hash[0] == ' ' && string2hash[1] == 0))
+	if (!string2hash || !string2hash[0] || (string2hash[0] == ' ' && string2hash[1] == 0))
 		return string2hash;
 
 	if (scramble != 0) {

@@ -273,6 +273,8 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 			b_slow_realign(buf, trash.area, 0);
 
 		h1m_init_req(&h1m);
+		/* pseudo-headers must not be turned into regular headers */
+		h1m.flags |= H1_MF_NO_PHDR;
 		ret = h1_headers_to_hdr_list(b_head(buf), b_stop(buf),
 					     hdrs, sizeof(hdrs)/sizeof(hdrs[0]), &h1m, &h1sl);
 		if (ret <= 0) {
@@ -1473,10 +1475,11 @@ static int smp_fetch_http_auth_bearer(const struct arg *args, struct sample *smp
 
 		ctx.blk = NULL;
 		if (http_find_header(htx, hdr_name, &ctx, 0)) {
+			struct ist value = ctx.value;
 			struct ist type = istsplit(&ctx.value, ' ');
 
 			/* no space was found or the space is the first character or no "Bearer" method */
-			if (!istlen(type) || istlen(type) == istlen(ctx.value) || !isteqi(type, ist("Bearer")))
+			if (!istlen(type) || istlen(type) == istlen(value) || !isteqi(type, ist("Bearer")))
 				return 0;
 
 			/* There must be "at least" one space character between
@@ -1486,6 +1489,8 @@ static int smp_fetch_http_auth_bearer(const struct arg *args, struct sample *smp
 			ctx.value = istskip(ctx.value, ' ');
 			chunk_initlen(&bearer_val, istptr(ctx.value), 0, istlen(ctx.value));
 		}
+		else
+			return 0;
 	}
 	else {
 		txn = smp->strm->txn.http;
@@ -1841,6 +1846,7 @@ static int smp_fetch_cookie_cnt(const struct arg *args, struct sample *smp, cons
 	char *val_beg, *val_end;
 	char *cook = NULL;
 	size_t cook_l = 0;
+	int is_req = !(check || (chn && chn->flags & CF_ISRESP));
 	int cnt;
 
 	if (args->type == ARGT_STR){
@@ -1851,7 +1857,7 @@ static int smp_fetch_cookie_cnt(const struct arg *args, struct sample *smp, cons
 	if (!htx)
 		return 0;
 
-	hdr = (!(check || (chn && chn->flags & CF_ISRESP)) ? ist("Cookie") : ist("Set-Cookie"));
+	hdr = (is_req ? ist("Cookie") : ist("Set-Cookie"));
 
 	val_end = val_beg = NULL;
 	ctx.blk = NULL;
@@ -1877,6 +1883,11 @@ static int smp_fetch_cookie_cnt(const struct arg *args, struct sample *smp, cons
 							    &smp->data.u.str.area,
 							    &smp->data.u.str.data))) {
 			cnt++;
+			if (!is_req) {
+				/* there's a single cookie per set-cookie header */
+				val_beg = NULL;
+				break;
+			}
 		}
 	}
 

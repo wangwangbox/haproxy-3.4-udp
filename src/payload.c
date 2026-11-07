@@ -154,7 +154,7 @@ smp_client_hello_parse( struct sample *smp, enum client_hello_type type, unsigne
 
 	if (hs_len < 4 ||                               /* minimum one cipher */
 	    (ext_len = (data[0] << 8) + data[1]) < 2 || /* minimum 2 bytes for a cipher */
-	    ext_len > hs_len)
+	    ext_len > hs_len - 2)                       /* ciphers must fit after cipher_len */
 		goto not_ssl_hello;
 
 	/* Jump to the compression methods. For fetching cipher list this processing is not required. */
@@ -335,8 +335,12 @@ smp_fetch_req_ssl_ec_ext(const struct arg *args, struct sample *smp, const char 
 		hs_len -= 4 + ext_len;
 		data   += 4 + ext_len;
 	}
-	/* server name not found */
-	goto not_ssl_hello;
+
+	/* EC not found */
+	smp->data.type = SMP_T_BOOL;
+	smp->data.u.sint = 0;
+	smp->flags = SMP_F_VOLATILE;
+	return 1;
 
  too_short:
 	smp->flags = SMP_F_MAY_CHANGE;
@@ -589,8 +593,8 @@ smp_fetch_ssl_supported_groups(const struct arg *args, struct sample *smp, const
 				goto not_ssl_hello;
 
 			grp_len = (data[4] << 8) + data[5]; /* Supported group list length */
-			if (grp_len < 2 || grp_len > hs_len - 6)
-				goto not_ssl_hello; /* at least 2 bytes per supported group */
+			if (grp_len < 2 || grp_len > ext_len - 2)
+				goto not_ssl_hello; /* at least 2 bytes per supported group, and the list must fit in the extension */
 
 			smp->data.type = SMP_T_BIN;
 			smp->data.u.str.area = (char *)data + 6;
@@ -644,8 +648,8 @@ smp_fetch_ssl_sigalgs(const struct arg *args, struct sample *smp, const char *kw
 				goto not_ssl_hello;
 
 			sigalg_len = (data[4] << 8) + data[5]; /* Sigalgs list length */
-			if (sigalg_len < 2 || sigalg_len > hs_len - 6)
-				goto not_ssl_hello; /* at least 2 bytes per sigalg */
+			if (sigalg_len < 2 || sigalg_len > ext_len - 2)
+				goto not_ssl_hello; /* at least 2 bytes per sigalg, and the list must fit in the extension */
 
 			smp->data.type = SMP_T_BIN;
 			smp->data.u.str.area = (char *)data + 6;
@@ -703,8 +707,8 @@ smp_fetch_ssl_keyshare_groups(const struct arg *args, struct sample *smp, const 
 				goto not_ssl_hello;
 
 			keyshare_len = (data[4] << 8) + data[5]; /* Client keyshare length */
-			if (keyshare_len < 4 || keyshare_len > hs_len - 6)
-				goto not_ssl_hello; /* at least 4 bytes for one keyshare entry */
+			if (keyshare_len < 4 || keyshare_len > ext_len - 2)
+				goto not_ssl_hello; /* at least 4 bytes for one keyshare entry, and the list must fit in the extension */
 			dataPointer = data + 6; /* start of keyshare entries */
 			readPosition = 0;
 			numberOfKeyshares = 0;
@@ -806,6 +810,9 @@ smp_fetch_ssl_hello_sni(const struct arg *args, struct sample *smp, const char *
 	data += 5; /* enter TLS handshake */
 	bleft -= 5;
 
+	if (bleft < hs_len)
+		goto too_short;
+
 	/* Check for a complete client hello starting at <data> */
 	if (bleft < 1)
 		goto too_short;
@@ -819,15 +826,18 @@ smp_fetch_ssl_hello_sni(const struct arg *args, struct sample *smp, const char *
 	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
 		goto not_ssl_hello; /* too short to have an extension */
 
+	data += 4;
+	bleft -= 4;
+
 	/* We want the full handshake here */
 	if (bleft < hs_len)
 		goto too_short;
 
-	data += 4;
 	/* Start of the ClientHello message */
 	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
 		goto not_ssl_hello;
 
+	/* Note: covered by the hs_len test 30 lines above */
 	ext_len = data[34]; /* session_id_len */
 	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
 		goto not_ssl_hello;
@@ -874,8 +884,8 @@ smp_fetch_ssl_hello_sni(const struct arg *args, struct sample *smp, const char *
 				goto not_ssl_hello;
 
 			srv_len = (data[4] << 8) + data[5];
-			if (srv_len < 4 || srv_len > hs_len - 6)
-				goto not_ssl_hello; /* at least 4 bytes per server name */
+			if (srv_len < 4 || srv_len > ext_len - 2)
+				goto not_ssl_hello; /* at least 4 bytes per server name, and the list must fit in the extension */
 
 			name_type = data[6];
 			name_len = (data[7] << 8) + data[8];
@@ -979,6 +989,9 @@ smp_fetch_ssl_hello_alpn(const struct arg *args, struct sample *smp, const char 
 	data += 5; /* enter TLS handshake */
 	bleft -= 5;
 
+	if (bleft < hs_len)
+		goto too_short;
+
 	/* Check for a complete client hello starting at <data> */
 	if (bleft < 1)
 		goto too_short;
@@ -992,15 +1005,18 @@ smp_fetch_ssl_hello_alpn(const struct arg *args, struct sample *smp, const char 
 	if (hs_len < 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + 2)
 		goto not_ssl_hello; /* too short to have an extension */
 
+	data += 4;
+	bleft -= 4;
+
 	/* We want the full handshake here */
 	if (bleft < hs_len)
 		goto too_short;
 
-	data += 4;
 	/* Start of the ClientHello message */
 	if (data[0] < 0x03 || data[1] < 0x01) /* TLSv1 minimum */
 		goto not_ssl_hello;
 
+	/* Note: covered by the hs_len test 30 lines above */
 	ext_len = data[34]; /* session_id_len */
 	if (ext_len > 32 || ext_len > (hs_len - 35)) /* check for correct session_id len */
 		goto not_ssl_hello;

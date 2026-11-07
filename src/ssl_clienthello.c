@@ -457,10 +457,48 @@ sni_lookup:
 		struct ssl_bind_conf *conf = sni_ctx->conf;
 		ssl_sock_switchctx_set(ssl, sni_ctx->ctx);
 		if (conf) {
+#if defined(SSL_CTX_set1_curves_list)
+			const char *curves;
+#endif
+
 			methodVersions[conf->ssl_methods.min].ssl_set_version(ssl, SET_MIN);
 			methodVersions[conf->ssl_methods.max].ssl_set_version(ssl, SET_MAX);
 			if (conf->early_data)
 				allow_early = 1;
+#if defined(OPENSSL_IS_AWSLC) && AWSLC_API_VERSION > 30
+			/* AWS-LC copies the cipher lists at SSL_new() time and does
+			 * not update them on SSL_set_SSL_CTX(). Reapply the crt-list
+			 * options. API version 30 (AWS-LC 3.x) uses the SSL_CTX
+			 * cipher lists directly and does not need this workaround.
+			 * These calls are inefficient as they parse the cipher
+			 * configuration strings for each connection.
+			 */
+			if ((conf->ciphers && !SSL_set_cipher_list(ssl, conf->ciphers)) ||
+			    (conf->ciphersuites && !SSL_set_ciphersuites(ssl, conf->ciphersuites))) {
+				HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
+				TRACE_ERROR("Cannot set the crt-list ciphers on the SSL object",
+				            SSL_EV_CONN_SWITCHCTX_CB|SSL_EV_CONN_ERR, conn);
+				goto abort;
+			}
+#endif
+#if defined(SSL_CTX_set1_curves_list)
+			/* Reapply the curves copied at SSL_new() time, using the
+			 * same precedence as when preparing the SSL_CTX: crt-list
+			 * curves, bind curves, crt-list ecdhe, then bind ecdhe.
+			 * This call is inefficient as it parses the curves
+			 * configuration string for each connection.
+			 */
+			curves = conf->curves ? conf->curves : s->ssl_conf.curves;
+			if (!curves)
+				curves = conf->ecdhe ? conf->ecdhe : s->ssl_conf.ecdhe;
+
+			if (curves && !SSL_set1_curves_list(ssl, curves)) {
+				HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
+				TRACE_ERROR("Cannot set the crt-list curves on the SSL object",
+				            SSL_EV_CONN_SWITCHCTX_CB|SSL_EV_CONN_ERR, conn);
+				goto abort;
+			}
+#endif
 		}
 		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
 		goto allow_early;
@@ -629,15 +667,18 @@ sni_lookup:
 		}
 	}
 	if (!node) {
+		/* Nothing more to look up in the tree, and
+		 * ssl_sock_generate_certificate() takes this same lock in read
+		 * mode, which must not be done recursively.
+		 */
+		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
 #if (!defined SSL_NO_GENERATE_CERTIFICATES)
 		if (s->options & BC_O_GENERATE_CERTS && ssl_sock_generate_certificate(servername, s, ssl)) {
 			/* switch ctx done in ssl_sock_generate_certificate */
-			HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
 			TRACE_STATE("No context found, generate certificate", SSL_EV_CONN_SWITCHCTX_CB, NULL, ssl, servername);
 			return SSL_TLSEXT_ERR_OK;
 		}
 #endif
-		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
 
 		if (!(s->ssl_options & BC_SSL_O_STRICT_SNI) && !default_lookup) {
 			/* we didn't find a SNI, and we didn't look for a default

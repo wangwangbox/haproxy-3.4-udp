@@ -1426,6 +1426,8 @@ void ssl_store_delete_cafile_entry(struct cafile_entry *ca_e)
 	if (!ca_e)
 		return;
 
+	sk_X509_NAME_pop_free(ca_e->ca_list, X509_NAME_free);
+
 	X509_STORE_free(ca_e->ca_store);
 
 	list_for_each_entry_safe(link, link_s, &ca_e->ckch_inst_link, list) {
@@ -1857,6 +1859,7 @@ static int cli_parse_show_sni(char **args, char *payload, struct appctx *appctx,
 
 	while (*args[cur_arg]) {
 		struct proxy *px;
+		int found = 0;
 
 		if (strcmp(args[cur_arg], "-f") == 0) {
 
@@ -1876,11 +1879,12 @@ static int cli_parse_show_sni(char **args, char *payload, struct appctx *appctx,
 				if (strcmp(px->id, args[cur_arg+1]) == 0) {
 					ctx->px = px;
 					ctx->options |= SHOW_SNI_OPT_1FRONTEND;
+					found = 1;
 					break;
 				}
 			}
 			cur_arg++; /* skip the argument */
-			if (px == NULL)
+			if (!found)
 				return cli_err(appctx, "Couldn't find the specified frontend!\n");
 
 		} else if (strcmp(args[cur_arg], "-A") == 0) {
@@ -2659,17 +2663,23 @@ static int cli_io_handler_dump_cert(struct appctx *appctx)
 		if (BIO_reset(bio) == -1)
 			goto end_no_putchk;
 
-		if (!PEM_write_bio_PrivateKey(bio, ckchs->data->key, NULL, NULL, 0, 0, NULL))
-			goto end_no_putchk;
+		/* In some specific cases we miht end up with only a
+		 * certificate but no private key (for JWT token validation for
+		 * instance).
+		 */
+		if (ckchs->data->key) {
+			if (!PEM_write_bio_PrivateKey(bio, ckchs->data->key, NULL, NULL, 0, 0, NULL))
+				goto end_no_putchk;
 
-		write = BIO_read(bio, out->area, out->size-1);
-		if (write == 0)
-			goto end_no_putchk;
-		out->area[write] = '\0';
-		out->data = write;
+			write = BIO_read(bio, out->area, out->size-1);
+			if (write == 0)
+				goto end_no_putchk;
+			out->area[write] = '\0';
+			out->data = write;
 
-		if (applet_putchk(appctx, out) == -1)
-			goto end_no_putchk;
+			if (applet_putchk(appctx, out) == -1)
+				goto end_no_putchk;
+		}
 
 		index++;
 

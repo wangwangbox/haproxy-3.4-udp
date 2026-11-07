@@ -437,14 +437,14 @@ static enum act_parse_ret parse_http_normalize_uri(const char **args, int *orig_
 	else if (strcmp(args[cur_arg], "path-strip-dotdot") == 0) {
 		cur_arg++;
 
+		rule->action = ACT_NORMALIZE_URI_PATH_STRIP_DOTDOT;
+
 		if (strcmp(args[cur_arg], "full") == 0) {
 			cur_arg++;
 			rule->action = ACT_NORMALIZE_URI_PATH_STRIP_DOTDOT_FULL;
 		}
-		else if (!*args[cur_arg]) {
-			rule->action = ACT_NORMALIZE_URI_PATH_STRIP_DOTDOT;
-		}
-		else if (strcmp(args[cur_arg], "if") != 0 && strcmp(args[cur_arg], "unless") != 0) {
+		else if (*args[cur_arg] &&
+		         strcmp(args[cur_arg], "if") != 0 && strcmp(args[cur_arg], "unless") != 0) {
 			memprintf(err, "unknown argument '%s' for 'path-strip-dotdot' normalizer", args[cur_arg]);
 			return ACT_RET_PRS_ERR;
 		}
@@ -457,14 +457,14 @@ static enum act_parse_ret parse_http_normalize_uri(const char **args, int *orig_
 	else if (strcmp(args[cur_arg], "percent-to-uppercase") == 0) {
 		cur_arg++;
 
+		rule->action = ACT_NORMALIZE_URI_PERCENT_TO_UPPERCASE;
+
 		if (strcmp(args[cur_arg], "strict") == 0) {
 			cur_arg++;
 			rule->action = ACT_NORMALIZE_URI_PERCENT_TO_UPPERCASE_STRICT;
 		}
-		else if (!*args[cur_arg]) {
-			rule->action = ACT_NORMALIZE_URI_PERCENT_TO_UPPERCASE;
-		}
-		else if (strcmp(args[cur_arg], "if") != 0 && strcmp(args[cur_arg], "unless") != 0) {
+		else if (*args[cur_arg] &&
+		         strcmp(args[cur_arg], "if") != 0 && strcmp(args[cur_arg], "unless") != 0) {
 			memprintf(err, "unknown argument '%s' for 'percent-to-uppercase' normalizer", args[cur_arg]);
 			return ACT_RET_PRS_ERR;
 		}
@@ -472,14 +472,14 @@ static enum act_parse_ret parse_http_normalize_uri(const char **args, int *orig_
 	else if (strcmp(args[cur_arg], "percent-decode-unreserved") == 0) {
 		cur_arg++;
 
+		rule->action = ACT_NORMALIZE_URI_PERCENT_DECODE_UNRESERVED;
+
 		if (strcmp(args[cur_arg], "strict") == 0) {
 			cur_arg++;
 			rule->action = ACT_NORMALIZE_URI_PERCENT_DECODE_UNRESERVED_STRICT;
 		}
-		else if (!*args[cur_arg]) {
-			rule->action = ACT_NORMALIZE_URI_PERCENT_DECODE_UNRESERVED;
-		}
-		else if (strcmp(args[cur_arg], "if") != 0 && strcmp(args[cur_arg], "unless") != 0) {
+		else if (*args[cur_arg] &&
+		         strcmp(args[cur_arg], "if") != 0 && strcmp(args[cur_arg], "unless") != 0) {
 			memprintf(err, "unknown argument '%s' for 'percent-decode-unreserved' normalizer", args[cur_arg]);
 			return ACT_RET_PRS_ERR;
 		}
@@ -793,6 +793,14 @@ static enum act_return http_action_req_capture(struct act_rule *rule, struct pro
 	struct cap_hdr *h = rule->arg.cap.hdr;
 	char **cap = s->req_cap;
 	int len;
+
+	/* The capture slot was declared in the proxy holding the rule, but the
+	 * slots of the stream are those of its frontend. When the rule is
+	 * evaluated from a listen section used as a backend, the slot does not
+	 * exist, so the rule is ignored.
+	 */
+	if (px != strm_fe(s))
+		return ACT_RET_CONT;
 
 	key = sample_fetch_as_type(s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->arg.cap.expr, SMP_T_STR);
 	if (!key)
@@ -1401,7 +1409,7 @@ static enum act_return http_action_early_hint(struct act_rule *rule, struct prox
 			goto error;
 		if (!http_forward_proxy_resp(s, 0))
 			goto error;
-		s->txn.http->status = 0;
+		s->txn.http->status = -1;
 	}
 
   leave:
@@ -1418,7 +1426,7 @@ static enum act_return http_action_early_hint(struct act_rule *rule, struct prox
 	 * HTTP 103 response from the buffer */
 	channel_htx_truncate(res, htx);
 	ret = ACT_RET_ERR;
-	s->txn.http->status = 0;
+	s->txn.http->status = -1;
 	goto leave;
 }
 

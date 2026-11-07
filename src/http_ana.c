@@ -1666,6 +1666,17 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		txn->flags |= TX_CON_WANT_TUN;
 	}
 
+	/* check if we need to switch to no-delay for SSE */
+	if (!(s->scf->flags & SC_FL_SND_NEVERWAIT)) {
+		struct http_hdr_ctx ctx = { .blk = NULL };
+
+		if (http_find_header(htx, ist("content-type"), &ctx, 0) &&
+		    isteqi(ctx.value, ist("text/event-stream"))) {
+			s->scf->flags |= SC_FL_SND_NEVERWAIT;
+			s->scb->flags |= SC_FL_SND_NEVERWAIT;
+		}
+	}
+
 	/* Check for NTML authentication headers in 401 (WWW-Authenticate) and
 	 * 407 (Proxy-Authenticate) responses and set the connection to
 	 * private.
@@ -1996,6 +2007,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 		send_log(s->be, LOG_ALERT,
 			 "Blocking cacheable cookie in response from instance %s, server %s.\n",
 			 s->be->id, objt_server(s->target) ? __objt_server(s->target)->id : "<dispatch>");
+		txn->status = 502;
 		goto deny;
 	}
 
@@ -2377,7 +2389,6 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	/* don't send any error message as we're in the body */
 	http_set_term_flags(s);
 	http_reply_and_close(s, txn->status, NULL);
-	stream_inc_http_fail_ctr(s);
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 	return 0;
@@ -2550,7 +2561,14 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 				if (ptr != NULL)
 					sep = ((ptr+1 != b_tail(chunk)) ? '&' : '\0');
 
+				/* On the response path the request may already have
+				 * been forwarded and its start line released, in
+				 * which case there is no query-string to preserve.
+				 */
 				sl = http_get_stline(htx);
+				if (!sl)
+					break;
+
 				parser = http_uri_parser_init(htx_sl_req_uri(sl));
 				path = http_parse_path(&parser);
 				ptr = istptr(path);
@@ -3856,7 +3874,8 @@ static void http_manage_server_side_cookies(struct stream *s, struct channel *re
 
 					ctx.value = ist2(val_beg, val_end - val_beg);
 				        ctx.lws_before = ctx.lws_after = 0;
-					http_replace_header_value(htx, &ctx, ist2(srv->cookie, srv->cklen), 0);
+					if (!http_replace_header_value(htx, &ctx, ist2(srv->cookie, srv->cklen), 0))
+						goto rewrite_err;
 					delta     = srv->cklen - (val_end - val_beg);
 					sliding   = (ctx.value.ptr - val_beg);
 					hdr_beg  += sliding;
@@ -3874,7 +3893,8 @@ static void http_manage_server_side_cookies(struct stream *s, struct channel *re
 					int sliding, delta;
 					ctx.value = ist2(val_beg, 0);
 				        ctx.lws_before = ctx.lws_after = 0;
-					http_replace_header_value(htx, &ctx, ist2(srv->cookie, srv->cklen + 1), 0);
+					if (!http_replace_header_value(htx, &ctx, ist2(srv->cookie, srv->cklen + 1), 0))
+						goto rewrite_err;
 					delta     = srv->cklen + 1;
 					sliding   = (ctx.value.ptr - val_beg);
 					hdr_beg  += sliding;
@@ -3893,6 +3913,13 @@ static void http_manage_server_side_cookies(struct stream *s, struct channel *re
 			 */
 		}
 	}
+	return;
+
+ rewrite_err:
+	if (s->be_tgcounters)
+		_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
+	if (s->sess->fe_tgcounters)
+		_HA_ATOMIC_INC(&s->sess->fe_tgcounters->failed_rewrites);
 }
 
 /*
@@ -4573,14 +4600,14 @@ static void http_end_request(struct stream *s)
 		 * direction, and sometimes for a close to be effective.
 		 */
 		if (txn->flags & TX_CON_WANT_TUN) {
-			/* Tunnel mode will not have any analyser so it needs to
-			 * poll for reads.
-			 */
+			/* Tunnel mode needs to poll for reads. */
 			channel_auto_read(&s->req);
 			txn->req.msg_state = HTTP_MSG_TUNNEL;
 			s->scb->flags &= ~SC_FL_NOHALF;
 			if (txn->rsp.msg_state != HTTP_MSG_TUNNEL)
 				s->res.flags |= CF_WAKE_ONCE;
+			else if (s->tunnel_timeout)
+				s->scf->ioto = s->scb->ioto = s->tunnel_timeout;
 		}
 		else {
 			/* we're not expecting any new data to come for this
@@ -4693,6 +4720,8 @@ static void http_end_response(struct stream *s)
 			txn->rsp.msg_state = HTTP_MSG_TUNNEL;
 			if (txn->req.msg_state != HTTP_MSG_TUNNEL)
 				s->req.flags |= CF_WAKE_ONCE;
+			else if (s->tunnel_timeout)
+				s->scf->ioto = s->scb->ioto = s->tunnel_timeout;
 		}
 		else {
 			/* we're not expecting any new data to come for this

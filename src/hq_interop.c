@@ -96,7 +96,8 @@ static ssize_t hq_interop_rcv_buf_req(struct qcs *qcs, struct buffer *b, int fin
 	sl->info.req.meth = find_http_meth("GET", 3);
 
 	htx_add_endof(htx, HTX_BLK_EOH);
-	htx->flags |= HTX_FL_EOM;
+	if (fin)
+		htx->flags |= HTX_FL_EOM;
 	htx_to_buf(htx, &htx_buf);
 
 	if (qcs_attach_sc(qcs, &htx_buf, fin)) {

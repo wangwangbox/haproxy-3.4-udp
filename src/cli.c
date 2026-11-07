@@ -798,7 +798,13 @@ static int cli_process_cmdline(struct appctx *appctx)
 
 	orig = p = b_head(appctx->cli_ctx.cmdline);
 	end = p + strlen(p);
-	end_of_cmdline = (appctx->cli_ctx.payload_pat ? appctx->cli_ctx.payload_pat - strlen(PAYLOAD_PATTERN) : b_tail(appctx->cli_ctx.cmdline)-1);
+	/* The command line chunk is filled from its beginning and never wraps.
+	 * Don't use b_tail() to find its end, it wraps to the beginning of the
+	 * area when the command line fills the whole chunk.
+	 */
+	end_of_cmdline = (appctx->cli_ctx.payload_pat
+			  ? appctx->cli_ctx.payload_pat - strlen(PAYLOAD_PATTERN)
+			  : orig + b_data(appctx->cli_ctx.cmdline) - 1);
 	/*
 	 * Get pointers on words.
 	 * One extra slot is reserved to store a pointer on a null byte.
@@ -991,6 +997,8 @@ int cli_try_realloc_payload(struct appctx *appctx, struct buffer *buf, size_t ne
 {
 	char *old, *new;
 
+	BUG_ON(new_size == 0);
+
 	if (new_size > appctx->cli_ctx.max_payload_sz)
 		new_size = appctx->cli_ctx.max_payload_sz;
 
@@ -1031,6 +1039,9 @@ int cli_parse_cmdline(struct appctx *appctx)
 	while (1) {
 		struct buffer *buf;
 
+		if (!b_data(&appctx->inbuf))
+			break;
+
 		/* payload doesn't take escapes nor does it end on semi-colons,
 		 * so we use the regular getline. Normal mode however must stop
 		 * on LFs and semi-colons that are not prefixed by a backslash.
@@ -1039,10 +1050,13 @@ int cli_parse_cmdline(struct appctx *appctx)
 		 */
 		buf = (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) ? &appctx->cli_ctx.payload : appctx->cli_ctx.cmdline;
 		str = b_tail(buf);
-		if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD))
-			len = b_getdelim(&appctx->inbuf, 0, b_data(&appctx->inbuf), str, b_room(buf), "\n;", '\\');
-		else
-			len = b_getline(&appctx->inbuf, 0, b_data(&appctx->inbuf), str, b_room(buf) - 1);
+		len = 0;
+		if (b_room(buf)) {
+			if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD))
+				len = b_getdelim(&appctx->inbuf, 0, b_data(&appctx->inbuf), str, b_room(buf), "\n;", '\\');
+			else
+				len = b_getline(&appctx->inbuf, 0, b_data(&appctx->inbuf), str, b_room(buf) - 1);
+		}
 
 		if (!len) {
 			if (!b_room(buf) || (b_data(&appctx->inbuf) > b_room(buf) - 1)) {
@@ -1086,6 +1100,11 @@ int cli_parse_cmdline(struct appctx *appctx)
 				continue;
 			}
 
+			while (*str && (*str == ' ' || *str == '\t')) {
+				str++;
+				len--;
+			}
+
 			if (!len)
 				goto process_cmdline;
 
@@ -1119,6 +1138,11 @@ int cli_parse_cmdline(struct appctx *appctx)
 
 			if (strncmp(last_arg, PAYLOAD_PATTERN, strlen(PAYLOAD_PATTERN)) == 0) {
 				ssize_t pat_len = strlen(last_arg) - strlen(PAYLOAD_PATTERN);
+
+				if (str == last_arg) {
+					cli_err(appctx, "The payload cannot be passed without command.\n");
+					goto error;
+				}
 
 				/* A customized pattern can't be more than 64 characters
 				 * if it's more, don't make it a payload
@@ -1849,7 +1873,7 @@ static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, 
 	if (*args[arg] == '!' || *args[arg] == '-')
 		ctx->show_mask = CLI_SHOWFD_F_ANY;
 
-	while (*args[arg] && !isdigit((uchar)*args[arg])) {
+	while (*args[arg] && !isdigit((uchar)*args[arg]) && *args[arg] != '/') {
 		uint flag = 0, inv = 0;
 		c = args[arg];
 		while (*c) {
@@ -1879,7 +1903,7 @@ static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, 
 		ctx->show_mask = CLI_SHOWFD_F_ANY;
 
 	if (*args[arg]) {
-		c = strchr(args[2], '/');
+		c = strchr(args[arg], '/');
 		if (c) {
 			/* We allow the forms "<tgid>/" and "/<fd>" where the missing
 			 * value is considered a wildcard. So the first form means
@@ -1888,10 +1912,10 @@ static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, 
 			 * that the tgid is parsed but ignored for now - this code
 			 * will require changes once we split fd tables.
 			 */
-			if (c == args[2]) {
+			if (c == args[arg]) {
 				ctx->tgid = -1;
 			} else {
-				ctx->tgid = atoi(args[2]);
+				ctx->tgid = atoi(args[arg]);
 				if (ctx->tgid <= 0 || ctx->tgid > MAX_TGROUPS)
 					return cli_err(appctx, "Invalid TGID.\n");
 			}
@@ -1901,7 +1925,7 @@ static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, 
 				ctx->show_one = 1;
 			}
 		} else {
-			ctx->fd = atoi(args[2]);
+			ctx->fd = atoi(args[arg]);
 			ctx->show_one = 1;
 		}
 	}
@@ -2279,6 +2303,7 @@ static int cli_parse_wait(char **args, char *payload, struct appctx *appctx, voi
 			"    duration. Supported conditions are:\n"
 			"    - <none> : by default, just sleep for the specified duration.\n"
 			"    - srv-removable <px>/<sv> : wait for this server to become removable.\n"
+			"    - be-removable <px> : wait for this backend to become removable.\n"
 			"";
 
 		if (strcmp(args[2], "-h") == 0)

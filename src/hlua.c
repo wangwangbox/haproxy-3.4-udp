@@ -2751,6 +2751,14 @@ static int hlua_socket_init(struct appctx *appctx)
 	struct hlua_csk_ctx *csk_ctx = appctx->svcctx;
 	struct stream *s;
 
+	/* The lua socket owner was released, by the garbage collector or by an
+	 * explicit close, before any connect attempt. There is nothing to
+	 * initialize, just report an error. This way, the applet is released by
+	 * the thread owning it.
+	 */
+	if (csk_ctx->die)
+		goto error;
+
 	if (appctx_finalize_startup(appctx, socket_proxy, &BUF_NULL) == -1)
 		goto error;
 
@@ -2818,18 +2826,21 @@ __LJMP static int hlua_socket_gc(lua_State *L)
 
 	ctx = container_of(peer, struct hlua_csk_ctx, xref);
 
+	/* Notify the applet it must die and wake it up. It is important to do
+	 * so before disconnecting the xref: the applet may be owned by another
+	 * thread and, once the xref is disconnected, it is free to be released
+	 * at any time. <ctx> is part of the applet's context, so it must no
+	 * longer be dereferenced after that point.
+	 *
+	 * Note the applet may not be initialized yet (no connect performed). In
+	 * this case, waking it up is safe: its init callback function will fail
+	 * and the applet will be released by the thread owning it.
+	 */
+	ctx->die = 1;
+	appctx_wakeup(ctx->appctx);
+
 	/* Remove all reference between the Lua stack and the coroutine stream. */
 	xref_disconnect(&socket->xref, peer);
-
-	if (se_fl_test(ctx->appctx->sedesc, SE_FL_ORPHAN)) {
-		/* The applet was never initialized, just release it */
-		appctx_free(ctx->appctx);
-	}
-	else {
-		/* Otherwise, notify it that is must die and wake it up */
-		ctx->die = 1;
-		appctx_wakeup(ctx->appctx);
-	}
 
 	return 0;
 }
@@ -3326,7 +3337,7 @@ static int hlua_socket_send(struct lua_State *L)
 #define SOCKET_INFO_MAX_LEN sizeof("[0000:0000:0000:0000:0000:0000:0000:0000]:12345")
 __LJMP static inline int hlua_socket_info(struct lua_State *L, const struct sockaddr_storage *addr)
 {
-	static char buffer[SOCKET_INFO_MAX_LEN];
+	char buffer[SOCKET_INFO_MAX_LEN];
 	int ret;
 	int len;
 	char *p;
@@ -4616,7 +4627,8 @@ __LJMP static int hlua_channel_send_yield(lua_State *L, int status, lua_KContext
 		len = sz - l;
 	}
 
-	ret = _hlua_channel_insert(chn, L, ist2(str, len), offset);
+	/* <l> bytes were already sent by a previous pass, resume from there */
+	ret = _hlua_channel_insert(chn, L, ist2(str + l, len), offset);
 	if (ret == -1) {
 		lua_pop(L, 1);
 		lua_pushinteger(L, -1);
@@ -7367,15 +7379,13 @@ static int _hlua_http_msg_dup(struct http_msg *msg, lua_State *L, size_t offset,
 				break;
 
 			default:
-				if (!ret)
-					goto no_data;
 				goto end;
 		}
 		offset = 0;
 	}
 
-end:
-	if (!ret && (htx->flags & HTX_FL_EOM))
+  end:
+	if (!ret)
 		goto no_data;
 	luaL_pushresult(&b);
 	return ret;
@@ -10053,12 +10063,13 @@ __LJMP static void hlua_event_hdl_cb_push_args(struct hlua_event_sub *hlua_sub,
 		 * (if it wasn't removed yet, SERVER_DEL will never succeed here)
 		 */
 		px = proxy_find_by_id(e_server->safe.proxy_uuid, PR_CAP_BE, 0);
-		BUG_ON(!px);
-		server = server_find_by_id_unique(px, e_server->safe.puid, e_server->safe.rid);
-		if (server) {
-			lua_pushstring(hlua->T, "reference");
-			hlua_fcn_new_server(hlua->T, server);
-			lua_settable(hlua->T, -3);
+		if (px) {
+			server = server_find_by_id_unique(px, e_server->safe.puid, e_server->safe.rid);
+			if (server) {
+				lua_pushstring(hlua->T, "reference");
+				hlua_fcn_new_server(hlua->T, server);
+				lua_settable(hlua->T, -3);
+			}
 		}
 	}
 	/* sub mgmt */
@@ -11632,6 +11643,21 @@ static void hlua_applet_http_release(struct appctx *ctx)
 	http_ctx->hlua = NULL;
 }
 
+/* Release the private data attached to a Lua action or service rule. */
+static void release_hlua_rule(struct act_rule *rule)
+{
+	if (rule->arg.hlua_rule) {
+		if (rule->arg.hlua_rule->args) {
+			int i;
+
+			for (i = 0; rule->arg.hlua_rule->args[i]; i++)
+				ha_free(&rule->arg.hlua_rule->args[i]);
+			ha_free(&rule->arg.hlua_rule->args);
+		}
+		ha_free(&rule->arg.hlua_rule);
+	}
+}
+
 /* global {tcp|http}-request parser. Return ACT_RET_PRS_OK in
  * success case, else return ACT_RET_PRS_ERR.
  *
@@ -11680,6 +11706,7 @@ static enum act_parse_ret action_register_lua(const char **args, int *cur_arg, s
 
 	rule->action = ACT_CUSTOM;
 	rule->action_ptr = hlua_action;
+	rule->release_ptr = release_hlua_rule;
 	return ACT_RET_PRS_OK;
 
   error:
@@ -11733,6 +11760,7 @@ static enum act_parse_ret action_register_service_http(const char **args, int *c
 	rule->applet.fct = hlua_applet_http_fct;
 	rule->applet.release = hlua_applet_http_release;
 	rule->applet.timeout = hlua_timeout_applet;
+	rule->release_ptr = release_hlua_rule;
 
 	return ACT_RET_PRS_OK;
 }
@@ -11921,6 +11949,7 @@ static enum act_parse_ret action_register_service_tcp(const char **args, int *cu
 	rule->applet.fct = hlua_applet_tcp_fct;
 	rule->applet.release = hlua_applet_tcp_release;
 	rule->applet.timeout = hlua_timeout_applet;
+	rule->release_ptr = release_hlua_rule;
 
 	return 0;
 }
@@ -14019,9 +14048,6 @@ int hlua_post_init()
 	struct hlua_function *fcn;
 	struct hlua_reg_filter *reg_flt;
 
-	hlua_body = 0;
-
-
 #if defined(USE_OPENSSL)
 	/* Initialize SSL server. */
 	if (socket_ssl->xprt->prepare_srv) {
@@ -14135,6 +14161,8 @@ int hlua_post_init()
 
 	if (errors > 0)
 		return 0;
+
+	hlua_body = 0;
 
 	/* after this point, this global will no longer be used, so set to
 	 * -1 in order to have probably a segfault if someone use it

@@ -1667,8 +1667,8 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 
 	for (px = proxies_list; px; px = px->next) {
 		if (clrall) {
-			memset(&px->be_counters, 0, sizeof(px->be_counters));
-			memset(&px->fe_counters, 0, sizeof(px->fe_counters));
+			counters_be_reset(&px->be_counters);
+			counters_fe_reset(&px->fe_counters);
 		}
 		else {
 			px->be_counters.conn_max = 0;
@@ -1689,7 +1689,7 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 
 		for (sv = px->srv; sv; sv = sv->next)
 			if (clrall)
-				memset(&sv->counters, 0, sizeof(sv->counters));
+				counters_be_reset(&sv->counters);
 			else {
 				sv->counters.cur_sess_max = 0;
 				sv->counters.nbpend_max = 0;
@@ -1703,7 +1703,7 @@ void proxy_stats_clear_counters(int clrall, struct list *stat_modules)
 		list_for_each_entry(li, &px->conf.listeners, by_fe)
 			if (li->counters) {
 				if (clrall)
-					memset(li->counters, 0, sizeof(*li->counters));
+					counters_fe_reset(li->counters);
 				else
 					li->counters->conn_max = 0;
 			}

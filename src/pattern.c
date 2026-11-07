@@ -607,7 +607,6 @@ struct pattern *pat_match_regm(struct sample *smp, struct pattern_expr *expr, in
 		if (regex_exec_match2(pattern->ptr.reg, smp->data.u.str.area, smp->data.u.str.data,
 		                      MAX_MATCH, pmatch, 0)) {
 			ret = pattern;
-			smp->ctx.a[0] = pmatch;
 			break;
 		}
 	}
@@ -2719,16 +2718,17 @@ struct pattern *pattern_exec_match(struct pattern_head *head, struct sample *smp
 		HA_RWLOCK_RDLOCK(PATEXP_LOCK, &list->expr->lock);
 		pat = head->match(smp, list->expr, fill);
 		if (pat) {
-			/* We duplicate the pattern cause it could be modified
-			   by another thread */
-			if (pat != &static_pattern) {
+			/* If the caller wants a copy of the pattern (fill), we
+			 * duplicate it because it could be modified by another
+			 * thread.
+			 */
+			if (fill && pat != &static_pattern) {
 				memcpy(&static_pattern, pat, sizeof(struct pattern));
 				pat = &static_pattern;
 			}
 
-			/* We also duplicate the sample data for
-			   same reason */
-			if (pat->data && (pat->data != &static_sample_data)) {
+			/* We also duplicate the sample data for same reason */
+			if (fill && pat->data && (pat->data != &static_sample_data)) {
 				switch(pat->data->type) {
 					case SMP_T_STR:
 						static_sample_data.type = SMP_T_STR;

@@ -363,7 +363,7 @@ static int cli_parse_show_events(char **args, char *payload, struct appctx *appc
 
 	if (!*args[1]) {
 		/* no arg => report the list of supported sink */
-		chunk_printf(&trash, "Supported events sinks are listed below. Add -0(zero), -w(wait), -n(new). Any key to stop.\n");
+		chunk_printf(&trash, "Supported events sinks are listed below. Add -0(zero), -w(wait), -n(new), -s(anitize). Any key to stop.\n");
 		list_for_each_entry(sink, &sink_list, sink_list) {
 			chunk_appendf(&trash, "    %-10s : type=%s, %u dropped, %s\n",
 				      sink->name,
@@ -397,6 +397,8 @@ static int cli_parse_show_events(char **args, char *payload, struct appctx *appc
 			ring_flags |= RING_WF_END_ZERO;
 		else if (strcmp(args[arg], "-nw") == 0 || strcmp(args[arg], "-wn") == 0)
 			ring_flags |= RING_WF_WAIT_MODE | RING_WF_SEEK_NEW;
+		else if (strcmp(args[arg], "-s") == 0)
+			ring_flags |= RING_WF_SANITIZE;
 		else
 			return cli_err(appctx, "unknown option");
 	}
@@ -453,13 +455,22 @@ static void _sink_forward_io_handler(struct appctx *appctx,
 		goto out;
 	}
 
+	MT_LIST_DELETE(&appctx->wait_entry);
+
+	/* The lock must not be held across ring_dispatch_messages(), which may
+	 * isolate the thread when attaching to the ring. A thread spinning on
+	 * a lock never becomes harmless, so isolating while holding this lock
+	 * would deadlock against process_sink_forward(). It is not needed
+	 * either: sft->ofs and sft->e_processed are only ever accessed from
+	 * this applet, which is bound to a single thread, and the lists are
+	 * mt_lists which protect themselves.
+	 */
+	ret = ring_dispatch_messages(ring, appctx, &sft->ofs, &last_ofs, 0,
+	                             msg_handler, '\n', &processed);
+
 	HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
 	BUG_ON(appctx != sft->appctx);
 
-	MT_LIST_DELETE(&appctx->wait_entry);
-
-	ret = ring_dispatch_messages(ring, appctx, &sft->ofs, &last_ofs, 0,
-	                             msg_handler, '\n', &processed);
 	sft->e_processed += processed;
 
 	/* if server's max-reuse is set (>= 0), destroy the applet once the
@@ -601,6 +612,7 @@ static void sink_forward_session_release(struct appctx *appctx)
 	HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
 	BUG_ON(sft->appctx != appctx);
 	__sink_forward_session_deinit(sft);
+	sft->last_close = now_ms;
 	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 }
 
@@ -675,7 +687,6 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 		goto out_close;
 	appctx->svcctx = (void *)sft;
 	appctx_wakeup(appctx);
-	sft->last_conn = now_ms;
 	return appctx;
 
 	/* Error unrolling */
@@ -703,11 +714,19 @@ static struct task *process_sink_forward(struct task * task, void *context, unsi
 			 *
 			 * We enforce a tempo to ensure we don't perform more than 1 session
 			 * establishment attempt per second.
+			 *
+			 * Note: last_close will wrap after 24.85 days, which may happen if
+			 * the server remains unavailable for that long, in that case it will
+			 * cause the tick_is_expired() test to always fail since tempo will be
+			 * in the future. This means the applet will stop trying to reconnect
+			 * to the server. We accept this pitfall because a server that was
+			 * unavailable for that long can be considered as definitely dead, but
+			 * this is something to keep in mind.
 			 */
 			if (!sft->appctx) {
-				int tempo = tick_add(sft->last_conn, MS_TO_TICKS(1000));
+				int tempo = tick_add(sft->last_close, MS_TO_TICKS(1000));
 
-				if (sft->last_conn == TICK_ETERNITY || tick_is_expired(tempo, now_ms))
+				if (sft->last_close == TICK_ETERNITY || tick_is_expired(tempo, now_ms))
 					sft->appctx = sink_forward_session_create(sink, sft);
 				else if (task->expire == TICK_ETERNITY)
 					task->expire = tempo;
@@ -1269,6 +1288,9 @@ struct sink *sink_new_from_logger(struct logger *logger)
 	if (!srv)
 		goto error;
 
+	/* there will be no defaults, we must initialize settings */
+	srv_settings_init(srv);
+
 	/* init server */
 	srv->id = strdup(logger->target.ring_name);
 	srv->conf.file = strdup(logger->conf.file);
@@ -1276,6 +1298,13 @@ struct sink *sink_new_from_logger(struct logger *logger)
 	srv->addr = *logger->target.addr;
 	srv->svc_port = get_host_port(logger->target.addr);
 	HA_SPIN_INIT(&srv->lock);
+
+	/* This server is created from a POST_CHECK hook, that is after
+	 * check_config_validity() has run srv_preinit() over all the servers
+	 * known at that point, so it would never be initialized otherwise.
+	 */
+	if (srv_preinit(srv) & ERR_CODE)
+		goto error;
 
 	if (sink_finalize(sink) & ERR_CODE)
 		goto error;
@@ -1385,7 +1414,14 @@ int sink_resolve_logger_buffer(struct logger *logger, char **msg)
 
 	BUG_ON(target->type != LOG_TARGET_BUFFER || (target->flags & LOG_TARGET_FL_RESOLVED));
 	if (target->addr) {
-		sink = sink_new_from_logger(logger);
+		/* The same "log" directive may exist as multiple logger copies:
+		 * dup_logger() is used for "log global", either directly or via
+		 * a defaults section, as well as for internal proxies. Let's be
+		 * careful not to re-create a new ring for each reference!
+		 */
+		sink = sink_find(target->ring_name);
+		if (!sink)
+			sink = sink_new_from_logger(logger);
 		if (!sink) {
 			memprintf(msg, "cannot be initialized (failed to create implicit ring)");
 			err_code |= ERR_ALERT | ERR_FATAL;

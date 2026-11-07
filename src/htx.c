@@ -52,7 +52,7 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk, uint32_t blkinf
 	struct htx *tmp = htxbuf(chunk);
 	struct htx_blk *newblk, *oldblk;
 	enum htx_blk_type type;
-	uint32_t new, old, blkpos;
+	uint32_t old, blkpos;
 	uint32_t blksz;
 
 	if (htx->head == -1)
@@ -60,7 +60,6 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk, uint32_t blkinf
 
 	blkpos = -1;
 
-	new  = 0;
 	tmp->size = htx->size;
 	tmp->data = 0;
 
@@ -94,13 +93,11 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk, uint32_t blkinf
 
 		/* update the start-line position */
 		if (htx->first == old)
-			tmp->first = new;
+			tmp->first = htx_get_blk_pos(tmp, newblk);
 
 		/* if <blk> is defined, save its new position */
 		if (blk == oldblk)
-			blkpos = new;
-
-		new++;
+			blkpos = htx_get_blk_pos(tmp, newblk);
 	}
 
 	htx->data = tmp->data;
@@ -159,7 +156,14 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
 	struct htx_blk *blk;
 	uint32_t tail, headroom, tailroom;
 
-	if (blksz > htx_free_data_space(htx))
+	/* A block descriptor must always be reserved, even for a zero-sized
+	 * block. htx_free_data_space() returns 0 when there is not even enough
+	 * room for a descriptor, so it cannot be used alone here: a zero-sized
+	 * block would pass the test and a descriptor would then be placed
+	 * outside of the blocks table, overwriting the payload.
+	 */
+	if (blksz > htx_free_data_space(htx) ||
+	    htx_free_space(htx) < sizeof(struct htx_blk))
 		return NULL; /* full */
 
 	if (htx->head == -1) {
@@ -184,7 +188,6 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
 	else if (htx->head > 0) {
 		htx_defrag_blks(htx);
 		tail = htx->tail + 1;
-		BUG_ON(htx_pos_to_addr(htx, tail) < htx->tail_addr);
 	}
 	else
 		goto defrag;
@@ -218,6 +221,7 @@ static struct htx_blk *htx_reserve_nxblk(struct htx *htx, uint32_t blksz)
 		/* need to defragment the message before inserting upfront */
 		htx_defrag(htx, NULL, 0);
 		tail = htx->tail + 1;
+		BUG_ON(htx_pos_to_addr(htx, tail) < htx->tail_addr + blksz);
 		blk = htx_get_blk(htx, tail);
 		blk->addr = htx->tail_addr;
 		htx->tail_addr += blksz;
@@ -641,15 +645,24 @@ struct htx_blk *htx_add_data_atonce(struct htx *htx, struct ist data)
 struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 				      const struct ist old, const struct ist new)
 {
+	enum htx_blk_type type;
 	struct ist n, v;
 	int32_t delta;
 	int ret;
 
+	type = htx_get_blk_type(blk);
 	n  = htx_get_blk_name(htx, blk);
 	v  = htx_get_blk_value(htx, blk);
 	delta = new.len - old.len;
 
-	if (unlikely(htx_get_blk_type(blk) < HTX_BLK_EOH && htx_hdrs_too_big(htx, delta)))
+	/* The value length of a header or a trailer is encoded on 20 bits. It
+	 * must not overflow on the other fields of the block descriptor.
+	 */
+	if (unlikely((type == HTX_BLK_HDR || type == HTX_BLK_TLR) &&
+		     v.len + delta > 1048575))
+		return NULL;
+
+	if (unlikely(type < HTX_BLK_EOH && htx_hdrs_too_big(htx, delta)))
 		return NULL;
 
 	ret = htx_prepare_blk_expansion(htx, blk, delta);
@@ -738,7 +751,7 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 		free_trash_chunk(chunk);
 	}
 
-	if (htx_get_blk_type(blk) < HTX_BLK_EOH)
+	if (type < HTX_BLK_EOH)
 		htx->hdrs_data += delta;
 
 	return blk;
@@ -893,7 +906,8 @@ size_t htx_xfer(struct htx *dst, struct htx *src, size_t count, unsigned int fla
 	/* Everything was copied, transfer terminal HTX flags too */
 	if (!blk) {
 		dst->flags |= (src->flags & (HTX_FL_EOM|HTX_FL_PARSING_ERROR|HTX_FL_PROCESSING_ERROR));
-		src->flags = 0;
+		if (!(flags & HTX_XFER_KEEP_SRC_BLKS))
+			src->flags = 0;
 	}
 
 	return ret;
@@ -1031,6 +1045,9 @@ struct htx_blk *htx_replace_header(struct htx *htx, struct htx_blk *blk,
 
 	type = htx_get_blk_type(blk);
 	if (type != HTX_BLK_HDR)
+		return NULL;
+
+	if (name.len > 255 || value.len > 1048575)
 		return NULL;
 
 	delta = name.len + value.len - htx_get_blksz(blk);

@@ -589,6 +589,11 @@ static struct appctx *spoe_create_appctx(struct spoe_context *ctx)
  out_free_appctx:
 	appctx_free_on_early_error(appctx);
  out_free_spoe_appctx:
+	/* the context must not be left pointing to the applet we're about to
+	 * release, the caller still uses it on the error path.
+	 */
+	if (ctx->spoe_appctx == spoe_appctx)
+		ctx->spoe_appctx = NULL;
 	pool_free(pool_head_spoe_appctx, spoe_appctx);
  out_error:
 	send_log(&agent->fe, LOG_EMERG, "SPOE: [%s] failed to create SPOE applet\n", agent->id);
@@ -712,6 +717,9 @@ static void spoe_set_var(struct spoe_context *ctx, char *scope, char *name, int 
 	memset(varname, 0, sizeof(varname));
 	len = snprintf(varname, sizeof(varname), "%s.%s.%.*s",
 		       scope, agent->var_pfx, len, name);
+	/* reject truncated (thus different) names instead of using them */
+	if (len < 0 || len >= (int)sizeof(varname))
+		return;
 	if (agent->flags & SPOE_FL_FORCE_SET_VAR)
 		vars_set_by_name(varname, len, smp);
 	else
@@ -729,6 +737,9 @@ static void spoe_unset_var(struct spoe_context *ctx, char *scope, char *name, in
 	memset(varname, 0, sizeof(varname));
 	len = snprintf(varname, sizeof(varname), "%s.%s.%.*s",
 		       scope, agent->var_pfx, len, name);
+	/* reject truncated (thus different) names instead of using them */
+	if (len < 0 || len >= (int)sizeof(varname))
+		return;
 	vars_unset_by_name_ifexist(varname, len, smp);
 }
 
@@ -2555,9 +2566,7 @@ static int parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 
  finish:
 	/* move curmsgs to the agent message list */
-	curmsgs.n->p = &curagent->messages;
-	curmsgs.p->n = &curagent->messages;
-	curagent->messages = curmsgs;
+	LIST_SPLICE(&curagent->messages, &curmsgs);
 	LIST_INIT(&curmsgs);
 
 	conf->id    = strdup(engine ? engine : curagent->id);

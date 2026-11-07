@@ -168,6 +168,20 @@ error:
 }
 
 /*
+ * Must be called by the caller when it has consumed data from the httpclient
+ * response buffer, to let the applet fill it again. It is automatically called
+ * by httpclient_res_xfer(). Callers accessing <hc->res.buf> by hand must call it
+ * by themselves.
+ */
+void httpclient_res_consumed(struct httpclient *hc)
+{
+	if (hc->appctx) {
+		applet_will_consume(hc->appctx);
+		appctx_wakeup(hc->appctx);
+	}
+}
+
+/*
  * transfer the response to the destination buffer and wakeup the HTTP client
  * applet so it could fill again its buffer.
  *
@@ -180,14 +194,15 @@ int httpclient_res_xfer(struct httpclient *hc, struct buffer *dst)
 
 	ret = b_force_xfer(dst, &hc->res.buf, MIN(room, b_data(&hc->res.buf)));
 
-	/* call the client once we consumed all data */
-	if (!b_data(&hc->res.buf)) {
+	if (!b_data(&hc->res.buf))
 		b_free(&hc->res.buf);
-		if (ret && hc->appctx) {
-			applet_will_consume(hc->appctx);
-			appctx_wakeup(hc->appctx);
-		}
-	}
+
+	/* Some room was released in the response buffer. Notify the applet it
+	 * can fill it again.
+	 */
+	if (ret)
+		httpclient_res_consumed(hc);
+
 	return ret;
 }
 
@@ -247,7 +262,7 @@ int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end)
 /* Set the 'timeout server' in ms for the next httpclient request */
 void httpclient_set_timeout(struct httpclient *hc, int timeout)
 {
-	hc->timeout_server = timeout;
+	hc->timeout_server = MS_TO_TICKS(timeout);
 }
 
 /*
@@ -875,8 +890,17 @@ void httpclient_applet_io_handler(struct appctx *appctx)
 	}
 
 out:
-	if (appctx->st0 != HTTPCLIENT_S_RES_END && !b_is_null(&hc->res.buf)) {
-		/* Don't accept more data while the httpclient response buffer is not empty */
+	if (hc && appctx->st0 != HTTPCLIENT_S_RES_END &&
+	    !(hc->options & HTTPCLIENT_O_RES_ACCUM) && b_data(&hc->res.buf)) {
+		/* Don't accept more data while the httpclient response buffer is
+		 * not empty. It will be re-enabled by the caller, when it will
+		 * consume these data.
+		 *
+		 * This is only performed for callers consuming the response on
+		 * the fly. The others expect to retrieve the whole payload at
+		 * the end of the response. For these ones, we must continue to
+		 * fill the response buffer.
+		 */
 		applet_wont_consume(appctx);
 	}
 	return;

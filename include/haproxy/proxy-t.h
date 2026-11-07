@@ -472,6 +472,7 @@ struct proxy {
 		const char *file;		/* file where the section appears */
 		struct ceb_node uuid_node;	/* place in the tree of used IDs, indexes <uuid> above */
 		int line;			/* line where the section appears */
+		uint first_unused_id;           /* lowest ID to start searching unused ones from */
 		struct ceb_root *used_listener_id; /* list of listener IDs in use */
 		struct ceb_root *used_server_id;   /* list of server IDs in use */
 		struct ceb_root *used_server_name; /* list of server names in use */
@@ -511,12 +512,6 @@ struct proxy {
 						 * name is used
 						 */
 	struct list filter_configs;		/* list of the filters that are declared on this proxy */
-	struct {                                /* sequence in which declared filters on the proxy should be executed
-	                                         * (list of filter_sequence_elt)
-						 */
-		struct list req;                /* during request handling */
-		struct list res;                /* during response handling */
-	} filter_sequence;
 
 	struct guid_node guid;			/* GUID global tree node */
 	struct mt_list watcher_list;		/* list of elems which currently references this proxy instance (currently only used with backends) */

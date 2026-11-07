@@ -428,6 +428,7 @@ struct logformat_node_args node_args_list[] = {
 	{ "X", LOG_OPT_HEXA },
 	{ "E", LOG_OPT_ESC },
 	{ "bin", LOG_OPT_BIN },
+	{ "utf8", LOG_OPT_UTF8 },
 	{ "json", LOG_OPT_ENCODE_JSON },
 	{ "cbor", LOG_OPT_ENCODE_CBOR },
 	{  0,  0 }
@@ -1968,6 +1969,8 @@ int parse_logger(char **args, struct list *loggers, int do_del, const char *file
 
   error:
 	free(smp_rgs);
+	if (logger && logger->lb.smp_rgs == smp_rgs)
+		logger->lb.smp_rgs = NULL;
 	free_logger(logger);
 	return 0;
 }
@@ -2021,6 +2024,7 @@ struct lf_buildctx {
 	int options;   /* LOG_OPT_* options */
 	int typecast;  /* same as logformat_node->typecast */
 	int in_text;   /* inside variable-length text */
+	int utf8_skip; /* JSON: continuation bytes of an already emitted UTF-8 sequence */
 	union {
 		struct cbor_encode_ctx cbor; /* cbor-encode specific ctx */
 	} encode;
@@ -2030,8 +2034,8 @@ static THREAD_LOCAL char lf_buildbuf[256]; /* fixed size buffer for building sma
 
 /* helper to encode a single byte in hex form
  *
- * Returns the position of the last written byte on success and NULL on
- * error.
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static char *_encode_byte_hex(char *start, char *stop, unsigned char byte)
 {
@@ -2048,8 +2052,8 @@ static char *_encode_byte_hex(char *start, char *stop, unsigned char byte)
  * The function may only be called under CBOR context (that is when
  * LOG_OPT_ENCODE_CBOR option is set).
  *
- * Returns the position of the last written byte on success and NULL on
- * error.
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static char *_lf_cbor_encode_byte(struct cbor_encode_ctx *cbor_ctx,
                                   char *start, char *stop, unsigned char byte)
@@ -2095,6 +2099,9 @@ static inline void lf_buildctx_prepare(struct lf_buildctx *ctx,
 
 /* helper function for _lf_encode_bytes() to escape a single byte
  * with <escape>
+ *
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_escape_byte(char *start, char *stop,
                                     char byte, const char escape)
@@ -2110,6 +2117,9 @@ static inline char *_lf_escape_byte(char *start, char *stop,
 
 /* helper function for _lf_encode_bytes() to escape a single byte
  * with <escape> and deal with cbor-specific encoding logic
+ *
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_cbor_escape_byte(char *start, char *stop,
                                          char byte, const char escape,
@@ -2132,13 +2142,16 @@ static inline char *_lf_cbor_escape_byte(char *start, char *stop,
 /* helper function for _lf_encode_bytes() to encode a single byte
  * and escape it with <escape> if found in <map>
  *
+ * All these helpers receive the current byte in <byte> and the end of the
+ * input in <end>, which is NULL when the input is NUL-terminated.
+ *
  * The function assumes that at least 1 byte is available for writing
  *
- * Returns the address of the last written byte on success, or NULL
- * on error
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_map_escape_byte(char *start, char *stop,
-                                        const char *byte,
+                                        const char *byte, const char *end,
                                         const char escape, const long *map,
                                         const char **pending, uint8_t cbor_string_prefix,
                                         struct lf_buildctx *ctx)
@@ -2157,11 +2170,11 @@ static inline char *_lf_map_escape_byte(char *start, char *stop,
  *
  * The function assumes that at least 1 byte is available for writing
  *
- * Returns the address of the last written byte on success, or NULL
- * on error
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_cbor_map_escape_byte(char *start, char *stop,
-                                             const char *byte,
+                                             const char *byte, const char *end,
                                              const char escape, const long *map,
                                              const char **pending, uint8_t cbor_string_prefix,
                                              struct lf_buildctx *ctx)
@@ -2201,11 +2214,11 @@ static inline char *_lf_cbor_map_escape_byte(char *start, char *stop,
  *
  * The function assumes that at least 1 byte is available for writing
  *
- * Returns the address of the last written byte on success, or NULL
- * on error
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_rfc5424_escape_byte(char *start, char *stop,
-                                            const char *byte,
+                                            const char *byte, const char *end,
                                             const char escape, const long *map,
                                             const char **pending, uint8_t cbor_string_prefix,
                                             struct lf_buildctx *ctx)
@@ -2226,30 +2239,131 @@ static inline char *_lf_rfc5424_escape_byte(char *start, char *stop,
 	return start;
 }
 
+/* Writes at <start> the JSON escape sequence for byte <byte>, which is assumed
+ * to require escaping (i.e. to be tagged in json_escape_map). The two-character
+ * form is used for the characters which have one, and the six-character \u00XX
+ * form for the others.
+ *
+ * The function returns the address of the byte immediately after the last
+ * written byte, or NULL if the sequence does not fit before <stop>. It will not
+ * append a terminating NULL byte.
+ */
+static inline char *_lf_json_escape_seq(char *start, char *stop, unsigned char byte)
+{
+	char shortcut = 0;
+
+	switch (byte) {
+	case '"':  shortcut = '"';  break;
+	case '\\': shortcut = '\\'; break;
+	case '\b': shortcut = 'b';  break;
+	case '\f': shortcut = 'f';  break;
+	case '\n': shortcut = 'n';  break;
+	case '\r': shortcut = 'r';  break;
+	case '\t': shortcut = 't';  break;
+	}
+
+	if (shortcut) {
+		if (start + 2 >= stop)
+			return NULL;
+		*start++ = '\\';
+		*start++ = shortcut;
+		return start;
+	}
+
+	if (start + 6 >= stop)
+		return NULL;
+	*start++ = '\\';
+	*start++ = 'u';
+	*start++ = '0';
+	*start++ = '0';
+	*start++ = hextab[(byte >> 4) & 15];
+	*start++ = hextab[byte & 15];
+	return start;
+}
+
+/* Checks whether <s> starts with a multi-byte UTF-8 sequence which is valid as
+ * per RFC 3629 and does not span more than <len> bytes: no overlong form, no
+ * surrogate (U+D800..U+Dfff), nothing beyond U+10FFFF (U+FFFE and U+FFFF,
+ * which utf8_next() rejects as well, are simply escaped). The sequence may be
+ * terminated by a NUL byte before <len> bytes, since it is not a continuation
+ * byte. On success the code point is stored into <c> and the sequence length
+ * (2 to 4) is returned, otherwise zero is returned.
+ */
+static inline int _lf_json_utf8_len(const char *s, size_t len, unsigned int *c)
+{
+	unsigned char ret;
+
+	ret = utf8_next(s, MIN(len, 4), c);
+	if (utf8_return_code(ret) != UTF8_CODE_OK)
+		return 0;
+
+	ret = utf8_return_length(ret);
+	if (ret < 2 || ret > 4 || *c > 0x10FFFF)
+		return 0;
+
+	return ret;
+}
+
+/* Writes at <start> the valid UTF-8 sequence of <len> bytes found at <seq> and
+ * representing code point <c>, as reported by _lf_json_utf8_len(). It is
+ * copied as-is, except for the C1 control characters (U+0080 .. U+009F) which,
+ * just like the C0 ones (U+0000 .. U+001F), could be interpreted by a
+ * terminal, and which are written as their \u00XX escape sequence instead.
+ *
+ * The function returns the address of the byte immediately after the last
+ * written byte, or NULL if the whole sequence does not fit before <stop>, so
+ * that a sequence is never truncated. It will not append a terminating NULL
+ * byte.
+ */
+static inline char *_lf_json_utf8_seq(char *start, char *stop,
+                                      const char *seq, int len, unsigned int c)
+{
+	if (c < 0xa0)
+		return _lf_json_escape_seq(start, stop, c);
+
+	if (start + len > stop)
+		return NULL;
+	memcpy(start, seq, len);
+	return start + len;
+}
+
 /* helper function for _lf_encode_bytes() to encode a single byte
  * and escape it with <escape> if found in <map> or escape it with
- * '\' if found in json_escape_map
+ * '\' if found in json_escape_map. With LOG_OPT_UTF8, valid multi-byte
+ * UTF-8 sequences are emitted at once when their first byte is met
+ * instead, the following ones being skipped.
  *
  * The function assumes that at least 1 byte is available for writing
  *
- * Returns the address of the last written byte on success, or NULL
- * on error
+ * Returns the address of the byte immediately after the last written byte
+ * on success, or NULL on error. It will not append terminating NULL byte.
  */
 static inline char *_lf_json_escape_byte(char *start, char *stop,
-                                         const char *byte,
+                                         const char *byte, const char *end,
                                          const char escape, const long *map,
                                          const char **pending, uint8_t cbor_string_prefix,
                                          struct lf_buildctx *ctx)
 {
+	unsigned int c;
+	int len;
+
+	if (ctx->utf8_skip) {
+		/* already emitted with the sequence's first byte */
+		ctx->utf8_skip--;
+		return start;
+	}
+
 	if (!ha_bit_test((unsigned char)(*byte), map)) {
 		if (!ha_bit_test((unsigned char)(*byte), json_escape_map))
 			*start++ = *byte;
-		else {
-			if (start + 2 >= stop)
-				return NULL;
-			*start++ = '\\';
-			*start++ = *byte;
+		else if ((ctx->options & LOG_OPT_UTF8) &&
+		         (len = _lf_json_utf8_len(byte, end ? end - byte : 4, &c))) {
+			start = _lf_json_utf8_seq(start, stop, byte, len, c);
+			if (start)
+				ctx->utf8_skip = len - 1;
 		}
+		else
+			start = _lf_json_escape_seq(start, stop, *byte);
 	}
 	else
 		start = _lf_escape_byte(start, stop, *byte, escape);
@@ -2284,13 +2398,15 @@ static char *_lf_encode_bytes(char *start, char *stop,
 	const char *pending;
 	uint8_t cbor_string_prefix = 0;
 	char *(*encode_byte)(char *start, char *stop,
-	                     const char *byte,
+	                     const char *byte, const char *bytes_stop,
 	                     const char escape, const long *map,
 	                     const char **pending, uint8_t cbor_string_prefix,
 	                     struct lf_buildctx *ctx);
 
-	if (ctx->options & LOG_OPT_ENCODE_JSON)
+	if (ctx->options & LOG_OPT_ENCODE_JSON) {
 		encode_byte = _lf_json_escape_byte;
+		ctx->utf8_skip = 0;
+	}
 	else if (ctx->options & LOG_OPT_ENCODE_CBOR)
 		encode_byte = _lf_cbor_map_escape_byte;
 	else if (ctx->options & LOG_OPT_ESC)
@@ -2310,7 +2426,9 @@ static char *_lf_encode_bytes(char *start, char *stop,
 	}
 
 	if (start < stop) {
-		stop--; /* reserve one byte for the final '\0' */
+		stop--; /* reserve one byte for the final '\0' as encoding functions
+			 * will try to use all available space
+			 */
 
 		if ((ctx->options & LOG_OPT_ENCODE_CBOR) && !ctx->in_text) {
 			/* start indefinite-length cbor byte string or text */
@@ -2326,7 +2444,8 @@ static char *_lf_encode_bytes(char *start, char *stop,
 		 */
 		if (bytes && !bytes_stop) {
 			while (start < stop && *bytes != '\0') {
-				ret = encode_byte(start, stop, bytes, escape, map,
+				ret = encode_byte(start, stop, bytes, bytes_stop,
+				                  escape, map,
 				                  &pending, cbor_string_prefix,
 				                  ctx);
 				if (ret == NULL)
@@ -2336,7 +2455,8 @@ static char *_lf_encode_bytes(char *start, char *stop,
 			}
 		} else if (bytes) {
 			while (start < stop && bytes < bytes_stop) {
-				ret = encode_byte(start, stop, bytes, escape, map,
+				ret = encode_byte(start, stop, bytes, bytes_stop,
+				                  escape, map,
 				                  &pending, cbor_string_prefix,
 				                  ctx);
 				if (ret == NULL)
@@ -2395,6 +2515,49 @@ static char *lf_encode_chunk(char *start, char *stop,
 	                        ctx);
 }
 
+/* Same as escape_string() but for a JSON string content: the bytes tagged in
+ * json_escape_map cannot all be expressed with the two-character form that
+ * escape_string() emits, the others need the \u00XX one. When <raw> is set,
+ * valid multi-byte UTF-8 sequences are emitted as-is instead (see
+ * _lf_json_utf8_seq()).
+ *
+ * Return the address of the \0 character, or NULL on error
+ */
+static char *_lf_json_escape_string(char *start, char *stop,
+                                    const char *string, const char *string_stop,
+                                    int raw)
+{
+	if (start < stop) {
+		stop--; /* reserve one byte for the final '\0' */
+		while (start < stop && string < string_stop && *string != '\0') {
+			unsigned int c;
+			char *next;
+			int len;
+
+			if (!ha_bit_test((unsigned char)(*string), json_escape_map)) {
+				*start++ = *string++;
+				continue;
+			}
+
+			len = raw ? _lf_json_utf8_len(string, string_stop - string, &c) : 0;
+			if (len)
+				next = _lf_json_utf8_seq(start, stop, string, len, c);
+			else {
+				len = 1;
+				next = _lf_json_escape_seq(start, stop, *string);
+			}
+
+			if (!next)
+				break; /* does not fit, truncate here */
+			start = next;
+			string += len;
+		}
+		*start = '\0';
+		return start;
+	}
+	return NULL;
+}
+
 /*
  * Write a raw string in the log string
  * Take care of escape option
@@ -2412,9 +2575,7 @@ static inline char *_lf_text_len(char *dst, const char *src,
 	const long *escape_map = NULL;
 	char *ret;
 
-	if (ctx->options & LOG_OPT_ENCODE_JSON)
-		escape_map = json_escape_map;
-	else if (ctx->options & LOG_OPT_ESC)
+	if (ctx->options & LOG_OPT_ESC)
 		escape_map = rfc5424_escape_map;
 
 	if (src && len) {
@@ -2426,7 +2587,10 @@ static inline char *_lf_text_len(char *dst, const char *src,
 			 */
 			len = strnlen2(src, len);
 
-			ret = cbor_encode_text(&ctx->encode.cbor, dst, dst + size, src, len);
+			/* cbor_encode_text() doesn't append terminating NULL
+			 * byte, we must reserve 1 byte for that.
+			 */
+			ret = cbor_encode_text(&ctx->encode.cbor, dst, dst + size - 1, src, len);
 			if (ret == NULL)
 				return NULL;
 			len = ret - dst;
@@ -2435,6 +2599,15 @@ static inline char *_lf_text_len(char *dst, const char *src,
 		/* escape_string and strlcpy2 will both try to add terminating NULL-byte
 		 * to dst
 		 */
+		else if (ctx->options & LOG_OPT_ENCODE_JSON) {
+			char *ret;
+
+			ret = _lf_json_escape_string(dst, dst + size, src, src + len,
+			                             !!(ctx->options & LOG_OPT_UTF8));
+			if (ret == NULL)
+				return NULL;
+			len = ret - dst;
+		}
 		else if (escape_map) {
 			char *ret;
 
@@ -2612,9 +2785,12 @@ static char *lf_bool_encode(char *dst, size_t size, uint8_t value,
 		return ret;
 	}
 	if (ctx->options & LOG_OPT_ENCODE_CBOR) {
+		/* the cbor encoder doesn't append terminating NULL byte, we
+		 * must reserve 1 byte for that.
+		 */
 		if (value)
-			return _lf_cbor_encode_byte(&ctx->encode.cbor, dst, dst + size, 0xF5);
-		return _lf_cbor_encode_byte(&ctx->encode.cbor, dst, dst + size, 0xF4);
+			return _lf_cbor_encode_byte(&ctx->encode.cbor, dst, dst + size -1, 0xF5);
+		return _lf_cbor_encode_byte(&ctx->encode.cbor, dst, dst + size - 1, 0xF4);
 	}
 
 	return NULL; /* not supported */
@@ -2655,9 +2831,10 @@ static char *lf_int_encode(char *dst, size_t size, int64_t value,
 	}
 	else if (ctx->options & LOG_OPT_ENCODE_CBOR) {
 		/* Always print as a regular int64 number (STR typecast isn't
-		 * supported)
+		 * supported). The cbor encoder doesn't append terminating NULL
+		 * byte, we must reserve 1 byte for that.
 		 */
-		return cbor_encode_int64(&ctx->encode.cbor, dst, dst + size, value);
+		return cbor_encode_int64(&ctx->encode.cbor, dst, dst + size - 1, value);
 	}
 
 	return NULL; /* not supported */
@@ -3525,7 +3702,7 @@ const char sess_set_cookie[] = "NPDIRU67";	/* No set-cookie, Set-cookie found an
 #define LOG_CBOR_BYTE(x) do {                                          \
 			ret = _lf_cbor_encode_byte(&ctx->encode.cbor,  \
 			                           tmplog,             \
-			                           dst + maxsize,      \
+			                           dst + maxsize - 1,  \
 			                           (x));               \
 			if (ret == NULL)                               \
 				goto out;                              \
@@ -3546,7 +3723,7 @@ const char sess_set_cookie[] = "NPDIRU67";	/* No set-cookie, Set-cookie found an
 				_x[0] = (x);                                   \
 				ret = cbor_encode_text(&ctx->encode.cbor,      \
 				                       tmplog,                 \
-				                       dst + maxsize,          \
+				                       dst + maxsize - 1,      \
 				                       _x, sizeof(_x));        \
 				if (ret == NULL)                               \
 					goto out;                              \
@@ -3668,7 +3845,17 @@ static void init_log()
 		tmp++;
 	}
 
-	/* Initialize the escape map for JSON strings : '"\' */
+	/* Initialize the escape map for JSON strings. Section 8.6 states that
+	 * only the characters from 32 to 126 are emitted as-is in the logs, all
+	 * the others being encoded, and there is no reason for the JSON encoding
+	 * to be more permissive than the plain one: escaping them all also
+	 * spares us from having to care about the UTF-8 validity that RFC 8259
+	 * #8.1 demands, since a header value is made of arbitrary bytes and not
+	 * of text. On top of that, RFC 8259 #7 mandates escaping the double
+	 * quote, the backslash and everything below 0x20. The raw JSON encoding
+	 * is the only exception: its encoders detect the valid multi-byte UTF-8
+	 * sequences by themselves and emit them as-is.
+	 */
 	memset(json_escape_map, 0, sizeof(json_escape_map));
 
 	tmp = "\"\\";
@@ -3676,6 +3863,11 @@ static void init_log()
 		ha_bit_set(*tmp, json_escape_map);
 		tmp++;
 	}
+
+	for (i = 0; i < 0x20; i++)
+		ha_bit_set(i, json_escape_map);
+	for (i = 0x7f; i < 256; i++)
+		ha_bit_set(i, json_escape_map);
 
 	/* initialize the log header encoding map : '{|}"#' should be encoded with
 	 * '#' as prefix, as well as non-printable characters ( <32 or >= 127 ).
@@ -4120,7 +4312,7 @@ size_t sess_build_logline_orig(struct session *sess, struct stream *s,
 			}
 			else if (ctx->options & LOG_OPT_ENCODE_CBOR) {
 				ret = cbor_encode_text(&ctx->encode.cbor, tmplog,
-				                       dst + maxsize, tmp->name,
+				                       dst + maxsize - 1, tmp->name,
 				                       strlen(tmp->name));
 				if (ret == NULL)
 					goto out;
@@ -5921,10 +6113,13 @@ static void syslog_io_handler(struct appctx *appctx)
 		goto out;
 	}
 
+	/* Only leave early when no input buffer is available. An empty buffer
+	 * must still reach applet_getchar() below, because it is what reports
+	 * the client's shutdown.
+	 */
 	inbuf = applet_get_inbuf(appctx);
-	if (inbuf == NULL || !applet_input_data(appctx)) {
+	if (inbuf == NULL)
 		goto missing_data;
-	}
 
 	max_accept = l->bind_conf->maxaccept ? l->bind_conf->maxaccept : 1;
 	while (1) {
@@ -6908,7 +7103,7 @@ static int px_parse_log_steps(char **args, int section_type, struct proxy *curpx
 
 	if (args[1] == NULL) {
 		memprintf(err, "%s: invalid arguments, expects 'all' or a composition of logging"
-		               "steps separated by spaces.",
+		               "steps separated by commas.",
 		          args[0]);
 		goto end;
 	}

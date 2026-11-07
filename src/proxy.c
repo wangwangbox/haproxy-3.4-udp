@@ -586,6 +586,15 @@ const char *proxy_find_best_option(const char *word, const char **extra)
 		}
 	}
 
+	for (index = 0; cfg_opts3[index].name; index++) {
+		make_word_fingerprint(list_sig, cfg_opts3[index].name);
+		dist = word_fingerprint_distance(word_sig, list_sig);
+		if (dist < best_dist) {
+			best_dist = dist;
+			best_ptr = cfg_opts3[index].name;
+		}
+	}
+
 	while (extra && *extra) {
 		make_word_fingerprint(list_sig, *extra);
 		dist = word_fingerprint_distance(word_sig, list_sig);
@@ -1229,6 +1238,29 @@ static int proxy_parse_tcpka_intvl(char **args, int section, struct proxy *proxy
 }
 #endif
 
+/* Parser for "be-unpublished" proxy keyword. */
+static int proxy_parse_be_unpublished(char **args, int section_type, struct proxy *curpx,
+                                      const struct proxy *defpx, const char *file, int line,
+                                      char **err)
+{
+	if (curpx->cap & PR_CAP_DEF) {
+		memprintf(err, "'%s' not allowed in 'defaults' section.", args[0]);
+		goto err;
+	}
+
+	if (!(curpx->cap & PR_CAP_BE)) {
+		memprintf(err, "'%s' only available in backend or listen section.", args[0]);
+		goto err;
+	}
+
+	curpx->flags |= PR_FL_BE_UNPUBLISHED;
+
+	return 0;
+
+ err:
+	return -1;
+}
+
 static int proxy_parse_force_be_switch(char **args, int section_type, struct proxy *curpx,
                                        const struct proxy *defpx, const char *file, int line,
                                        char **err)
@@ -1597,8 +1629,6 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->conf.lf_checks);
 	LIST_INIT(&p->filter_configs);
 	LIST_INIT(&p->tcpcheck.preset_vars);
-	LIST_INIT(&p->filter_sequence.req);
-	LIST_INIT(&p->filter_sequence.res);
 
 	MT_LIST_INIT(&p->lbprm.lb_free_list);
 
@@ -2978,7 +3008,7 @@ static void defaults_px_free(struct proxy *defproxy)
 
 	/* default proxy specific cleanup */
 	if (defproxy->defsrv)
-		ha_free((char **)&defproxy->defsrv->conf.file);
+		srv_free_params(defproxy->defsrv);
 	ha_free(&defproxy->defbe.name);
 	srv_free(&defproxy->defsrv);
 
@@ -3382,7 +3412,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		srv_settings_cpy(curproxy->defsrv, defproxy->defsrv, 0);
 	}
 
-	curproxy->flags = (defproxy->flags & PR_FL_DISABLED); /* Only inherit from disabled flag */
+	curproxy->flags = (defproxy->flags & (PR_FL_DISABLED | PR_FL_DEF_EXPLICIT_MODE)); /* Only inherit disabled + explicit_mode flags */
 	curproxy->options = defproxy->options;
 	curproxy->options2 = defproxy->options2;
 	curproxy->no_options = defproxy->no_options;
@@ -4388,7 +4418,7 @@ static int post_section_px_cleanup()
 		 */
 
 		if (curproxy->defsrv) {
-			ha_free((char **)&curproxy->defsrv->conf.file);
+			srv_free_params(curproxy->defsrv);
 			srv_free(&curproxy->defsrv);
 		}
 	}
@@ -4427,6 +4457,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_LISTEN, "clitcpka-intvl", proxy_parse_tcpka_intvl },
 	{ CFG_LISTEN, "srvtcpka-intvl", proxy_parse_tcpka_intvl },
 #endif
+	{ CFG_LISTEN, "be-unpublished", proxy_parse_be_unpublished },
 	{ CFG_LISTEN, "force-be-switch", proxy_parse_force_be_switch },
 	{ CFG_LISTEN, "guid", proxy_parse_guid },
 	{ 0, NULL, NULL },
@@ -4651,6 +4682,14 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 	return 1;
 }
 
+/* release handler for "show servers conn|state" */
+static void cli_io_release_show_servers(struct appctx *appctx)
+{
+	struct show_srv_ctx *ctx = appctx->svcctx;
+	watcher_detach(&ctx->px_watch);
+	watcher_detach(&ctx->srv_watch);
+}
+
 /* Parses backend list and simply report backend names. It keeps the proxy
  * pointer in svcctx since there's nothing else to store there.
  */
@@ -4684,6 +4723,14 @@ static int cli_io_handler_show_backend(struct appctx *appctx)
 	}
 
 	return 1;
+}
+
+/* release handler for "show backend" */
+static void cli_io_release_show_backend(struct appctx *appctx)
+{
+	struct show_be_ctx *ctx = appctx->svcctx;
+	if (ctx->px)
+		watcher_detach(&ctx->px_watch);
 }
 
 /* Parses the "enable dynamic-cookies backend" directive, it always returns 1.
@@ -4958,7 +5005,7 @@ static int cli_parse_add_backend(char **args, char *payload, struct appctx *appc
 		goto err;
 	}
 
-	px = alloc_new_proxy(be_name, PR_CAP_BE, &msg);
+	px = alloc_new_proxy(be_name, PR_CAP_BE|PR_CAP_LB, &msg);
 	if (!px)
 		goto err;
 
@@ -5164,7 +5211,7 @@ static int cli_parse_delete_backend(char **args, char *payload, struct appctx *a
 		proxies_list = px->next;
 	}
 	else {
-		for (prev = proxies_list->next; prev && prev->next != px; prev = prev->next)
+		for (prev = proxies_list; prev && prev->next != px; prev = prev->next)
 			;
 		BUG_ON(!prev); /* Proxy instance not found in global list ? */
 		prev->next = px->next;
@@ -5509,6 +5556,13 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 	return 0;
 }
 
+/* release handler for "show errors" */
+static void cli_io_release_show_errors(struct appctx *appctx)
+{
+	struct show_errors_ctx *ctx = appctx->svcctx;
+	watcher_detach(&ctx->px_watch);
+}
+
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "add", "backend", NULL },                       "add backend <backend>                   : add a new backend",                                              cli_parse_add_backend, NULL, NULL, NULL, 0 },
@@ -5517,15 +5571,15 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "enable", "frontend",  NULL },                  "enable frontend <frontend>              : re-enable specific frontend",                                    cli_parse_enable_frontend, NULL, NULL },
 	{ { "publish", "backend",  NULL },                  "publish backend <backend>               : mark backend as ready for traffic",                              cli_parse_publish_backend, NULL, NULL },
 	{ { "set", "maxconn", "frontend",  NULL },          "set maxconn frontend <frontend> <value> : change a frontend's maxconn setting",                            cli_parse_set_maxconn_frontend, NULL },
-	{ { "show","servers", "conn",  NULL },              "show servers conn [<backend>]           : dump server connections status (all or for a single backend)",   cli_parse_show_servers, cli_io_handler_servers_state },
-	{ { "show","servers", "state",  NULL },             "show servers state [<backend>]          : dump volatile server information (all or for a single backend)", cli_parse_show_servers, cli_io_handler_servers_state },
-	{ { "show", "backend", NULL },                      "show backend                            : list backends in the current running config", NULL,              cli_io_handler_show_backend },
+	{ { "show","servers", "conn",  NULL },              "show servers conn [<backend>]           : dump server connections status (all or for a single backend)",   cli_parse_show_servers, cli_io_handler_servers_state, cli_io_release_show_servers, },
+	{ { "show","servers", "state",  NULL },             "show servers state [<backend>]          : dump volatile server information (all or for a single backend)", cli_parse_show_servers, cli_io_handler_servers_state, cli_io_release_show_servers, },
+	{ { "show", "backend", NULL },                      "show backend                            : list backends in the current running config",                    NULL, cli_io_handler_show_backend, cli_io_release_show_backend, },
 	{ { "shutdown", "frontend",  NULL },                "shutdown frontend <frontend>            : stop a specific frontend",                                       cli_parse_shutdown_frontend, NULL, NULL },
 	{ { "set", "dynamic-cookie-key", "backend", NULL }, "set dynamic-cookie-key backend <bk> <k> : change a backend secret key for dynamic cookies",                cli_parse_set_dyncookie_key_backend, NULL },
 	{ { "unpublish", "backend",  NULL },                "unpublish backend <backend>             : remove backend for traffic processing",                          cli_parse_unpublish_backend, NULL, NULL },
 	{ { "enable", "dynamic-cookie", "backend", NULL },  "enable dynamic-cookie backend <bk>      : enable dynamic cookies on a specific backend",                   cli_parse_enable_dyncookie_backend, NULL },
 	{ { "disable", "dynamic-cookie", "backend", NULL }, "disable dynamic-cookie backend <bk>     : disable dynamic cookies on a specific backend",                  cli_parse_disable_dyncookie_backend, NULL },
-	{ { "show", "errors", NULL },                       "show errors [<px>] [request|response]   : report last request and/or response errors for each proxy",      cli_parse_show_errors, cli_io_handler_show_errors, NULL },
+	{ { "show", "errors", NULL },                       "show errors [<px>] [request|response]   : report last request and/or response errors for each proxy",      cli_parse_show_errors, cli_io_handler_show_errors, cli_io_release_show_errors, },
 	{{},}
 }};
 

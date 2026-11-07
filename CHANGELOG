@@ -1,6 +1,264 @@
 ChangeLog :
 ===========
 
+2026/10/14 : 3.4.7
+    - MEDIUM: jwt: Reject "none" alg in jwt_verify by default
+    - MINOR: quic: implement the AEAD integrity limit
+    - BUG/MEDIUM: flt-http-comp: Block HTX_FL_EOM flag till the end of compression
+    - BUG/MINOR: flt-http-comp: Rely on htx_set_eom() to restore EOM flag
+    - MINOR: stconn: prefer to replace endpoints rather than detaching them
+    - BUILD: haring: fix compile issue due to nop warning.
+    - MINOR: stick-table: provide a function to estimate on-wire data size
+    - MINOR: stick-table: calculate the on-wire size of each key
+    - BUG/MEDIUM: stick-table: restrict key sizes to what fits in a buffer
+    - BUG/MEDIUM: pattern: don't dereference static_pattern's data when not filling it
+    - BUG/MINOR: jwe: Buffer overflow when filling fake cek in case of RSA1.5
+    - BUG/MINOR: jwe: Avoid buffer overflow in fake cek (RSA1.5)
+    - BUG/MINOR: http: do not consume the delimiter of a truncated q-factor
+    - BUG/MINOR: sample: apply the ms_/us_ time offsets in the input unit
+    - BUG/MINOR: sample: zero-pad the fractional part emitted by http_date()
+    - BUG/MINOR: sample: make quic_enabled() always succeed
+    - BUG/MINOR: http-ana: return a 502 when checkcache blocks a response
+    - BUG/MINOR: stick-table: do not count the lookup itself in table_trackers()
+    - BUG/MINOR: payload: always report a boolean from req.ssl_ec_ext
+    - BUG/MINOR: http-fetch: do not count Set-Cookie attributes as cookies
+    - BUG/MEDIUM: tcpcheck: do not run a regex on an unallocated buffer
+    - BUG/MINOR: sample: return the decoded JWT part when no path is given
+    - DOC: config: mention other responses not blocked by option checkcache
+    - DOC: config: fix doc for hex2i() converter on unparsable input
+    - DOC: config: mention that url_ip and url_port fail when passed a name
+    - BUG/MINOR: proxy: add PR_CAP_LB for dynamically added backend
+    - BUG/MINOR: server: fix "del server" description
+    - BUG/MINOR: cli: update wait help usage
+    - MINOR: http-ana: automatically enable http-no-delay for streaming events (SSE)
+    - BUG/MINOR: log: fix erroneous error message in log-steps parser
+    - BUG/MINOR: hq-interop: prevent double EOM on request with standalone FIN
+    - BUG/MINOR: ssl: fix trace crash on FE conn release in io cb
+    - BUG/MINOR: ssl: fix trace crash on BE conn release in io cb
+    - BUG/MEDIUM: ssl: crt-list ciphers ignored with AWS-LC
+    - BUG/MEDIUM: ssl: crt-list curves ignored with AWS-LC
+    - BUG/MEDIUM: listener: Consider maxconn before waking listeners
+    - BUG/MINOR: ssl: use standard names for X25519 and X448 groups
+    - BUG/MINOR: mux_quic: extend FINAL_SIZE_ERROR detection on stream
+    - BUG/MINOR: h3: reject frames with truncated header
+    - BUG/MINOR: h3: close connection on GOAWAY frame too long
+    - BUG/MINOR: h3: reject RS/SS for QPACK uni streams
+    - BUG/MINOR: ssl: Fix potential NULL-deref in "dump ssl cert" with AWS-LC
+    - MINOR: doc: elaborate on diagnostic mode behavior
+    - BUG/MAJOR: cfgparse: properly check userlist section when scanning keywords
+    - BUG/MINOR: cfgparse-global: add missing gotos to error label in max-spread-checks
+    - BUG/MINOR: cfgparse-global: add missing calloc() check for the global description
+    - BUG/MINOR: cfgparse-listen: release the previous description of the proxy
+    - BUG/MINOR: cfgparse-listen: fix the argument checked by "email-alert"
+    - BUG/MINOR: cfgparse-listen: fix quoting of the condition conflict warning
+    - BUG/MINOR: cfgparse-listen: properly reject extra args in a backend section
+    - BUG/MINOR: proxy: also look for the closest option among cfg_opts3
+    - BUG/MINOR: cfgparse-listen: complete the list of options for the suggestions
+    - BUG/MEDIUM: cli: fix the last command detection on a full command line
+    - REGTESTS: cli: test a command line of exactly tune.bufsize bytes
+    - BUG/MEDIUM: log: do not ignore the peer's shutdown in the syslog applet
+    - REGTESTS: log: check that a log-forward TCP session ends on client close
+    - BUG/MINOR: spoe: Fix the message list splice with an empty list
+    - BUG/MINOR: hlua: assume proxy_find_by_id() may return NULL on previously existing server
+    - BUG/MEDIUM: mux-h2: don't return a freed tasklet from h2_deferred_shut()
+    - BUG/MEDIUM: mux-fcgi: don't return a freed tasklet from fcgi_deferred_shut()
+    - BUG/MEDIUM: mux-h1: don't pass an upgraded connection to traces in h1s_destroy()
+    - BUG/MEDIUM: mux-h2: report a dead rhttp connection in h2_wake()
+    - BUG/MEDIUM: mux-h2: fix a possible crash on rxbuf allocation failure
+    - BUG/MEDIUM: mux-h1: also release the embryonic stream when the error is empty
+    - BUG/MINOR: http-fetch: don't report pseudo-headers in TCP mode
+    - BUG/MEDIUM: mux-h1: only accept the H2 preface on the first request
+    - REGTESTS: http-messaging: Fix http_fail_cnt_body to succeed with small timeouts
+    - REGTEST: ssl: require OpenSSL 1.1.1 for crt-list ciphersuites tests
+    - BUG/MINOR: cfgparse-global: only warn when "localpeer" is set together with -L
+    - BUG/MAJOR: mux-h2: properly handle short reads on PING frames
+    - BUG/MAJOR: h1-htx: report an error on a too long chunk-size line
+
+2026/09/28 : 3.4.6
+    - MINOR: log: pass the input end to the _lf_encode_bytes() byte encoders
+    - MINOR: log: add the +utf8 encoding option to let valid UTF-8 pass
+    - BUG/MAJOR: mux_quic: fix potential crash on RESET_STREAM receive
+    - BUG/MEDIUM: sink: reconnect attempt not working after session lasted more than ~25 days
+    - BUG/MEDIUM: server: skip log backend addr checks for internal proxies
+    - REGTESTS: log: check that a ring's internal server may target a UNIX socket
+
+2026/09/24 : 3.4.5
+    - BUG/MINOR: cache: Manage collisions on primary key
+    - BUG/MINOR: cache: Seed cache primary hash
+    - OPTIM: server: remember the lowest known unused server ID
+    - BUG/MEDIUM: mux-spop: Properly handle parsing of split HELLO/DISCONNECT frames
+    - BUG/MINOR: payload: fix the cipher_len bound check in smp_client_hello_parse()
+    - BUG/MINOR: payload: bound ClientHello extension lists by the extension length
+    - BUG/MEDIUM: quic: crash on key update phase change after a failed one
+    - BUG/MINOR: quic: late packets of the first key phase are dropped
+    - BUG/MEDIUM: filters: check the filter name before comparing it
+    - BUN/MINOR: hlua: reset hlua_body variable after per-thread files loading
+    - BUG/MINOR: resolvers: classify empty truncated responses
+    - CLEANUP: resolvers: stop clearing the DNS response buffer
+    - MINOR: quic: protect the ChaCha20 header protection context from being freed
+    - BUG/MINOR: qpack: encoder and decoder stream data is never consumed
+    - BUG/MINOR: qpack: accept a Required Insert Count which cannot be reached
+    - BUG/MINOR: quic: delete the wrong CIDs when post-handshake frames fail
+    - MINOR: ring: add "-s" flag to "show events" to sanitize the output
+    - REGTESTS: log: add a test for "show events -s"
+    - REGTESTS: log: check which log-format tags escape control characters
+    - DOC: config: mention that section 8.6 does not apply to the cbor encoding
+    - REGTESTS: log: check that the +cbor output passes the logged bytes through
+    - MEDIUM: mux-h1: Harden test for short data at end of stream
+    - BUG/MEDIUM: mux-h2: Make sure we remove H2_SF_NOTIFIED on subscribe
+    - BUG/MAJOR: h3: reject H3 truncated frames
+    - BUG/MINOR: quic: leak of the NEW_TOKEN frame on token generation failure
+    - DOC: config: clarify tune tune.bufsize doc regarding various limits
+    - BUG/MEDIUM: hlua: Never release a cosocket applet from the GC
+    - BUG/MINOR: mux-h1: Return an error on trailers if last chunk is unfinished
+    - BUG/MINOR: hlua: Always return nil if there is no data to dup for HTTP messages
+    - BUG/MEDIUM: htx: Don't reset flags when source must be preserved during transfer
+    - BUG/MINOR: stream/debug: harden the stream dump function regarding signals
+    - BUG/MINOR: h3: reject truncated frames with mandatory payload
+    - BUG/MEDIUM: h3: do not block FIN on empty DATA frame
+    - BUG/MINOR: h3: handle empty HEADERS frame as specified
+    - BUG/MINOR: h3: handle unknown frame type on request stream as specified
+    - BUG/MINOR: h3: only increment frame type counter on new header
+    - BUG/MEDIUM: http-ana: apply tunnel timeout with data filters
+    - BUG/MINOR: ssl: don't pass the address of a size_t as an int* to OpenSSL
+    - BUG/MEDIUM: map: do not overwrite the fetch context in pat_match_regm()
+    - REGTESTS: map: check map_regm inside an ACL over an iterating fetch
+    - BUG/MEDIUM: http_act: fix normalize-uri normalizer selection with a condition
+    - BUG/MEDIUM: cli: Don't parse next command if input buffer is empty
+    - BUG/MEDIUM: cli: Don't read a command or payload line into a full buffer
+    - BUG/MINOR: cli: Reject payload with no command
+    - BUG/MINOR: ssl: Fix leak of ca_list in cafile_entry
+    - BUG/MINOR: sample: reject a \0 byte in url_dec, json_query and jwt_*_query
+    - REGTESTS: http-rules: check "-m str" on a sample with an embedded \0
+    - DOC: configuration: clarify the validity ranges of sample types
+    - BUG/MEDIUM: ssl: don't set a 0 timeout on an expired TLS session
+    - BUG/MEDIUM: htx: Reserve a block descriptor for zero-sized blocks
+    - CLEANUP: stream: Remove an excess newline in the stream dump
+    - BUG/MEDIUM: tcp-rules: Don't restart tcp-request content evaluation on yield
+    - BUG/MINOR: proxy: pass PR_FL_DEF_EXPLICIT_MODE through cascaded defaults
+    - MAJOR: filters: Revert the filter-sequence directive
+    - OPTIM: tools: keep a cache of recent localtime() and gmtime()
+    - BUG/MEDIUM: task: Do not destroy a task that is not ours in task_destroy
+    - BUG/MEDIUM: http-client: Don't use the httpclient context if it was released
+    - MINOR: http-client: Add an option to not stop the reception of the response
+    - BUG/MEDIUM: ssl/ocsp: Set HTTPCLIENT_O_RES_ACCUM option on the http-client
+    - BUG/MEDIUM: acme: Set HTTPCLIENT_O_RES_ACCUM option on the http-client
+    - MINOR: http-client: Add a function to notify some data were consumed
+    - BUG/MEDIUM: http-client/cli: Notify the http-client when the response is consumed
+    - BUG/MEDIUM: htx: Fix the position returned by htx_defrag()
+    - BUG/MINOR: tools: Don't try to anonymize a NULL string
+    - BUG/MAJOR: htx: Check the header/trailer length limits when one is updated
+    - BUG/MINOR: hlua: release private Lua rule data on teardown
+    - BUG/MINOR: ssl: Fix possible null deref on the SSL context in ssl_sock_to_buf()
+    - BUG/MINOR: http-client: Convert server timeout ticks when setting it
+    - BUG/MINOR: mux-h2: Don't expect more HTX data on 1xx interim responses
+    - REG-TESTS: http-messaging: Add a script to test interim responses for H1/H2
+    - BUG/MEDIUM: log: reserve the trailing 0 in CBOR int and bool encoders
+    - BUG/MEDIUM: http-htx: don't build the new authority in a rotating trash chunk
+    - BUG/MEDIUM: http-act: ignore "capture len" rules evaluated from a backend
+    - BUG/MEDIUM: tcp-rules: ignore "capture len" rules evaluated from a backend
+    - BUG/MINOR: http-ana: count response body failures only once in http_fail_cnt
+    - BUG/MINOR: http-fetch: http_auth_bearer() must not match a missing header
+    - BUG/MINOR: http-fetch: fix the space check of http_auth_bearer(<hdr>)
+    - BUG/MINOR: mux-h1: only mark C-L and T-E as sent once the header is emitted
+    - BUG/MINOR: tcpcheck: refresh the start-line after updating the authority
+    - BUG/MINOR: http-ana: restore the transaction status after early hints
+    - BUG/MAJOR: mux_quic: fix leak on RESET_STREAM reception
+    - BUG/MEDIUM: mux_quic: activate timeout on FE init
+    - BUG/MEDIUM: log: encode the whole non-printable range in the +json output
+    - REGTESTS: log: check the escaping performed by the +json option
+    - BUG/MINOR: mux-h2: Reject trailers received on a tunneled stream
+
+2026/08/27 : 3.4.4
+    - BUG/MEDIUM: proxy: fix crash on delete first backend
+    - BUG/MINOR: cli: use the current argument to parse the FD spec in "show fd"
+    - BUG/MINOR: cli: do not reject the "/<fd>" form of "show fd"
+    - BUG/MINOR: ech: propagate error from load_echkeys()
+    - BUG/MINOR: ech: reject an ECH store with no usable private key
+    - BUG/MEDIUM: counters: preserve shared.tg pointer on 'clear counters all'
+    - BUG/MEDIUM: filter: Disable auto-close on channel during TCP payload filtering
+    - BUG/MINOR: server: check strdup return value on server ID
+    - BUG/MINOR: proxy: fix default-server leak on post-parsing cleanup
+    - MINOR: proxy: implement unpublished backend keyword
+    - DOC: explain better that named defaults are preserved
+    - BUG/MINOR: proxy: release watcher in various commands on CLI abort
+    - REGTESTS: proxy: complete "del backend" test
+    - BUG/MEDIUM: hpack: encode long methods and schemes using the long form
+    - BUG/MINOR: stats-file: reject tgid 0 when preloading shm objects
+    - BUG/MINOR: hlua: use a local buffer to format the socket addresses
+    - DEV: haring: bound the ring geometry to the size of the file
+    - BUG/MEDIUM: spoe: clear the applet pointer when the applet fails to start
+    - BUG/MINOR: mux-fcgi: don't call fcgi_strm_destroy() on a NULL stream
+    - BUG/MEDIUM: http-ana: don't crash on "keep-query" in a response redirect
+    - BUG/MEDIUM: stick-tables: use the same bucket for string keys with a NUL
+    - BUG/MEDIUM: sock: bound the recvmsg() length when receiving old sockets
+    - BUG/MEDIUM: http-ana: check the cookie rewrite result before moving the offsets
+    - BUG/MINOR: mux-fcgi: sanitize the STDERR records before logging them
+    - MINOR: log/tools: fix ambiguous comments for some log encoding helpers
+    - BUG/MEDIUM: log: always reserve room for trailing 0 when using CBOR encoding helpers
+    - BUG/MEDIUM: jwe: validate the secret length against the algorithm of the token
+    - BUG/MINOR: jwt: don't take an extra reference on the certificate public key
+    - BUG/MEDIUM: ssl: require a full-length AEAD tag when decrypting with AES-GCM
+    - BUG/MEDIUM: acme: don't delete a NULL token from the map
+    - BUG/MINOR: ssl: reject server certificate names containing a NUL byte
+    - BUG/MINOR: acme: restrict the permissions of the generated account key
+    - BUG/MINOR: connection: reserve the whole CRC32C TLV before saving its pointer
+    - BUG/MEDIUM: session: don't release a reversed connection twice on error
+    - BUG/MINOR: lb-chash: bound the walk when the saved cursor changed tree
+    - BUG/MINOR: debug: only dump the trace once in __BUG_ON_ONCE()
+    - BUG/MINOR: mux-h2: strip the userinfo when deriving :authority for a server
+    - BUG/MEDIUM: quic: prevent out-of-bound read on wrapping CRYPTO content
+    - BUG/MINOR: quic: drop multiple Retry on same connection
+    - BUG/MEDIUM: lua: resume Channel:send() from the unsent part of the string
+    - BUG/MEDIUM: hlua_fcn: ensure systematic bref cleanup for patref list iterator
+    - DOC: config: clarify req.ssl_sni
+    - BUG/MEDIUM: cache: retain the primary or secondary entry only when detaching its row
+    - BUG/MEDIUM: cache: do not release an entry under the cache read lock
+    - BUG/MINOR: wurfl: fix memory leak of information list and patch strings at deinit
+    - BUG/MINOR: ssl: reject an embedded NUL in the ssl_*_dn(entry) fetches
+    - BUG/MINOR: ssl: reject an embedded NUL in the full-DN ssl_*_dn() fetches
+    - BUG/MINOR: quic: avoid a division by zero in the BBR pacing interval
+    - BUG/MINOR: server: fix off-by-one error when parsing and copying source port range
+    - BUG/MEDIUM: http: fix authority parsing for absolute-form URI with empty path
+    - DOC: security: clarify that only up-to-date versions may get securty reports
+    - BUG/MEDIUM: bwlim: fix a stick-table entry leak in shared mode
+    - BUG/MINOR: payload: fix handshake length off-by-4 in ssl_hello_sni/alpn
+    - BUG/MINOR: spoe: check snprintf() return value in spoe_set_var/spoe_unset_var
+    - BUG/MINOR: qpack: missing shift count check in qpack_get_varint() (UB)
+    - BUG/MINOR: log: fix double-free error when error in parse_loger occurs
+    - BUG/MINOR: mux-h2: harden h2_dump_h2s_info() against potentially null h2s->sd
+    - BUG/MINOR: conn: Do not check 'sess_el' list on frontend connections in __trace_enabled
+    - BUG/MINOR: ssl: Fix leak of X509_NAME in traces
+    - BUG/MINOR: ssl: release the previous client cert reference at depth > 0
+    - BUG/MEDIUM: ssl: Fix unprotected 'ssl_sock_choose_sni_ctx' calls
+    - BUG/MEDIUM: ssl: enforce tune.ssl.lifetime across TLS1.3 session renewals
+    - BUG/MINOR: ssl: apply tune.ssl.lifetime to TLS1.3 sessions on BoringSSL/AWS-LC
+    - BUILD: ssl: disable the TLS1.3 session timeout clamp on wolfSSL
+    - BUG/MEDIUM: ssl: isolate TLS session resumption per X509 server certificate
+    - BUG/MINOR: ssl: isolate TLS session resumption per crt-list filter
+    - BUG/MEDIUM: ssl: isolate TLS session resumption per authentication policy
+    - BUG/MINOR: haproxy: fix out-of-scope tmpdir usage in do_chroot()
+    - BUG/MINOR: ssl/cli: fix frontend-not-found detection in 'show ssl sni -f'
+    - BUG/MINOR: resolvers: accept fields at the response boundary
+    - BUG/MEDIUM: sink: pre-initialize the implicit log forwarding server
+    - BUG/MEDIUM: mux-fcgi: check the room left before appending the index
+    - BUG/MINOR: ech: fix label at end of compound statement
+    - BUG/MINOR: hbuf: treat unexpected escape sequences as literals
+    - BUILD: ssl: avoid a potential null-dereference warning on OpenSSL 1.0.2
+    - BUG/MEDIUM: mux-h1: close the connection on a short content-length
+    - MEDIUM: mux-h2: don't report EOM on a short content-length message
+    - BUG/MEDIUM: connection: fix an infinite loop in the fc_pp_tlv() fetch
+    - BUG/MEDIUM: sink: do not hold the sft lock around ring_dispatch_messages()
+    - DOC: haterm: add a missing 'haterm' build target on an example
+    - MINOR: sample: add new converter has_ctl() to detect control characters
+    - MINOR: debug: check the match count in __BUG_ON_ONCE() and not in complain()
+    - REGTESTS: converters: use connection: close in the has_ctl() test
+    - BUG/MEDIUM: cache: ignore cache on redundant origin/referer
+    - BUG/MINOR: fcgi-app: allow explicit filter declaration with non-cache/non-compression filters
+    - BUG/MINOR: flt-http-comp: Don't read next block to detect end of data
+    - BUG/MEDIUM: sink: initialize the settings of the implicit log server
+    - BUG/MEDIUM: sink: do not create one implicit ring per logger copy
+
 2026/07/29 : 3.4.3
     - BUG/MEDIUM: h3: fix parser desync on error with multiple frames
     - BUG/MINOR: mux_quic: prevent multiple STOP_SENDING emission per stream
