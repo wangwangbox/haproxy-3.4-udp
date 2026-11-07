@@ -2,6 +2,7 @@
  * UDP proxying for regular listen/frontend sections.
  */
 
+#define _GNU_SOURCE /* required for struct in6_pktinfo with glibc */
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1054,7 +1055,12 @@ static struct server *udp_proxy_select_server(struct listener *l,
 	strm.sess = &sess;
 	strm.be = fe;
 	strm.rules_exp = TICK_ETERNITY;
-	strm.req.buf = b_make(payload, UDP_PROXY_RXBUF_SIZE, 0, payload_len);
+	/* The buffer is exactly as large as the datagram: it is full, so that
+	 * channel_may_recv() is false. Fetches then know no more data will
+	 * come, and do not dereference the stream connectors which do not exist
+	 * here (e.g. channel_input_closed() in smp_fetch_payload()).
+	 */
+	strm.req.buf = b_make(payload, payload_len, 0, payload_len);
 	vars_init_head(&strm.vars_txn, SCOPE_TXN);
 	vars_init_head(&strm.vars_reqres, SCOPE_REQ);
 
@@ -1210,10 +1216,14 @@ static void udp_proxy_log_session(struct udp_proxy_session *sess, enum udp_proxy
 	if (reason == UDP_END_TIMEOUT && (fe->options2 & PR_O2_NOLOGNORM))
 		return;
 
-	if (addr_to_str(&sess->client, cli, sizeof(cli)) <= 0)
-		strcpy(cli, "-");
-	if (addr_to_str(&sess->srv_addr, srv, sizeof(srv)) <= 0)
-		strcpy(srv, "-");
+	if (addr_to_str(&sess->client, cli, sizeof(cli)) <= 0) {
+		cli[0] = '-';
+		cli[1] = 0;
+	}
+	if (addr_to_str(&sess->srv_addr, srv, sizeof(srv)) <= 0) {
+		srv[0] = '-';
+		srv[1] = 0;
+	}
 
 	send_log(fe, reason == UDP_END_TIMEOUT ? LOG_INFO : LOG_NOTICE,
 	         "%s:%d [udp] %s %s/%s %s:%d %ums req=%llu/%llu res=%llu/%llu %s\n",
