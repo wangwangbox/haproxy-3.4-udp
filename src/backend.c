@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Backend variables and functions.
  *
  * Copyright 2000-2013 Willy Tarreau <w@1wt.eu>

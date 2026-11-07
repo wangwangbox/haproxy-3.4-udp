@@ -1,4 +1,4 @@
-﻿/*
+/*
  * HTTP/2 protocol processing
  *
  * Copyright 2017 Willy Tarreau <w@1wt.eu>

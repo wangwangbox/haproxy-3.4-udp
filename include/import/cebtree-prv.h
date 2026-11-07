@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Compact Elastic Binary Trees - internal functions and types
  *
  * Copyright (C) 2014-2025 Willy Tarreau - w@1wt.eu

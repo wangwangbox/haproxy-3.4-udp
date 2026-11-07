@@ -406,6 +406,7 @@ struct proxy {
 		int tunnel;                     /* I/O timeout to use in tunnel mode (in ticks) */
 		int clientfin;                  /* timeout to apply to client half-closed connections */
 		int serverfin;                  /* timeout to apply to server half-closed connections */
+		int udp;                        /* mode udp: idle timeout of a UDP session (in ticks) */
 	} timeout;
 	__decl_thread(HA_RWLOCK_T lock);        /* may be taken under the server's lock */
 

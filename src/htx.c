@@ -1,4 +1,4 @@
-﻿/*
+/*
  * internal HTTP message
  *
  * Copyright 2018 HAProxy Technologies, Christopher Faulet <cfaulet@haproxy.com>

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * HTTP/2 mux-demux for connections
  *
  * Copyright 2017 Willy Tarreau <w@1wt.eu>

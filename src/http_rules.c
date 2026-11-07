@@ -1,4 +1,4 @@
-﻿/*
+/*
  * HTTP rules parsing and registration
  *
  * Copyright 2000-2018 Willy Tarreau <w@1wt.eu>

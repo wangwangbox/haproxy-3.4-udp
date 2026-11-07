@@ -1,4 +1,4 @@
-﻿#include <haproxy/api.h>
+#include <haproxy/api.h>
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
 #include <haproxy/errors.h>

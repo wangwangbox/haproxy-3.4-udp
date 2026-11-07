@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/tools.h
  * This files contains some general purpose functions and macros.
  *

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/port_range-t.h
  * This file defines the prt_range type
  *

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/server-t.h
  * This file defines everything related to servers.
  *

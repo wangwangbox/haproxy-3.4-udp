@@ -1,4 +1,4 @@
-﻿/* SPDX-License-Identifier: LGPL-2.1-or-later */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #ifndef _HAPROXY_H1_HTX_T_H
 #define _HAPROXY_H1_HTX_T_H

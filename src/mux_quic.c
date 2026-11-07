@@ -1,4 +1,4 @@
-﻿#include <haproxy/mux_quic.h>
+#include <haproxy/mux_quic.h>
 #include <haproxy/mux_quic_priv.h>
 
 #include <import/eb64tree.h>

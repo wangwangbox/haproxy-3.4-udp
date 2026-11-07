@@ -1,4 +1,4 @@
-﻿#include <haproxy/stats-html.h>
+#include <haproxy/stats-html.h>
 
 #include <string.h>
 

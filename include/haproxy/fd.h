@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/fd.h
  * File descriptors states - exported variables and functions
  *

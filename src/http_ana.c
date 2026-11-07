@@ -1,4 +1,4 @@
-﻿/*
+/*
  * HTTP protocol analyzer
  *
  * Copyright (C) 2018 HAProxy Technologies, Christopher Faulet <cfaulet@haproxy.com>

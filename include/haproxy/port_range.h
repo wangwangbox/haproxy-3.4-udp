@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/port_range.h
  * This file defines everything needed to manage port ranges
  *

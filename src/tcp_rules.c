@@ -1,4 +1,4 @@
-﻿/*
+/*
  * "tcp" rules processing
  *
  * Copyright 2000-2016 Willy Tarreau <w@1wt.eu>

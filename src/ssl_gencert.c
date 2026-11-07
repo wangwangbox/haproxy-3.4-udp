@@ -1,4 +1,4 @@
-﻿/*
+/*
  * SSL 'generate-certificate' option logic.
  *
  * This program is free software; you can redistribute it and/or

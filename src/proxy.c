@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Proxy variables and functions.
  *
  * Copyright 2000-2009 Willy Tarreau <w@1wt.eu>
@@ -695,6 +695,11 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 		tv = &proxy->timeout.serverfin;
 		td = &defpx->timeout.serverfin;
 		cap = PR_CAP_BE;
+	} else if (strcmp(args[0], "udp") == 0) {
+		name = "udp";
+		tv = &proxy->timeout.udp;
+		td = &defpx->timeout.udp;
+		cap = PR_CAP_FE;
 	} else if (strcmp(args[0], "clitimeout") == 0) {
 		memprintf(err, "the '%s' directive is not supported anymore since HAProxy 2.1. Use 'timeout client'.", args[0]);
 		return -1;
@@ -708,7 +713,7 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 		memprintf(err,
 		          "'timeout' supports 'client', 'server', 'connect', 'check', "
 		          "'queue', 'handshake', 'http-keep-alive', 'http-request', 'tunnel', 'tarpit', "
-			  "'client-fin' and 'server-fin' (got '%s')",
+			  "'client-fin', 'server-fin' and 'udp' (got '%s')",
 		          args[0]);
 		return -1;
 	}
@@ -3491,6 +3496,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		curproxy->timeout.client = defproxy->timeout.client;
 		curproxy->timeout.client_hs = defproxy->timeout.client_hs;
 		curproxy->timeout.clientfin = defproxy->timeout.clientfin;
+		curproxy->timeout.udp = defproxy->timeout.udp;
 		curproxy->timeout.tarpit = defproxy->timeout.tarpit;
 		curproxy->timeout.httpreq = defproxy->timeout.httpreq;
 		curproxy->timeout.httpka = defproxy->timeout.httpka;

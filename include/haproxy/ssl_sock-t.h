@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/ssl_sock-t.h
  * SSL settings for listeners and servers
  *

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/connection-t.h
  * This file describes the connection struct and associated constants.
  *

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Health-checks functions.
  *
  * Copyright 2000-2009,2020 Willy Tarreau <w@1wt.eu>

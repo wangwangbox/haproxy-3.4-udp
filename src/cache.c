@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Cache management
  *
  * Copyright 2017 HAProxy Technologies

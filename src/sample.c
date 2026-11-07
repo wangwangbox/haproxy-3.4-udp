@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Sample management functions.
  *
  * Copyright 2009-2010 EXCELIANCE, Emeric Brun <ebrun@exceliance.fr>

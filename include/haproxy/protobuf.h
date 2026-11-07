@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/protobuf.h
  * This file contains functions and macros declarations for protocol buffers decoding.
  *

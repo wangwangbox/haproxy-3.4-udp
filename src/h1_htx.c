@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Functions to manipulate H1 messages using the internal representation.
  *
  * Copyright (C) 2019 HAProxy Technologies, Christopher Faulet <cfaulet@haproxy.com>

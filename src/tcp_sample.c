@@ -1,4 +1,4 @@
-﻿/*
+/*
  * AF_INET/AF_INET6 SOCK_STREAM protocol layer (tcp)
  *
  * Copyright 2000-2013 Willy Tarreau <w@1wt.eu>

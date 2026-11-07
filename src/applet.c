@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Functions managing applets
  *
  * Copyright 2000-2015 Willy Tarreau <w@1wt.eu>

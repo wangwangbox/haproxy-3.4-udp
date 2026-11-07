@@ -149,6 +149,7 @@ static inline void proxy_reset_timeouts(struct proxy *proxy)
 	proxy->timeout.httpreq = TICK_ETERNITY;
 	proxy->timeout.check = TICK_ETERNITY;
 	proxy->timeout.tunnel = TICK_ETERNITY;
+	proxy->timeout.udp = TICK_ETERNITY;
 }
 
 /* Return proxy's abortonclose status: 0=off, non-zero=on, with a default to

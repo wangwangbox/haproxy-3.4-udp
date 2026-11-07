@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Functions dedicated to statistics output and the stats socket
  *
  * Copyright 2000-2012 Willy Tarreau <w@1wt.eu>

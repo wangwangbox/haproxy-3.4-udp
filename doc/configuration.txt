@@ -6338,7 +6338,9 @@ timeout server                            X          -         X         X
 timeout server-fin                        X          -         X         X
 timeout tarpit                            X          X         X         X
 timeout tunnel                            X          -         X         X
+timeout udp                               X          X         X         -
 transparent                 (deprecated)  X          -         X         X
+udp-request                               -          X         X         -
 unique-id-format                          X          X         X         X
 unique-id-header                          X          X         X         -
 use_backend                               -          X         X         -
@@ -9754,7 +9756,7 @@ maxconn <conns>
   See also : "server", global section's "maxconn", "fullconn"
 
 
-mode { tcp|http|log|spop }
+mode { tcp|http|log|spop|udp }
   Set the running mode or protocol of the instance
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    yes   |   yes  |   yes
@@ -9786,6 +9788,55 @@ mode { tcp|http|log|spop }
               spop backend. This mode is mandatory if the backend contains
               SPOA servers, but when mode is tcp, it will automatically be
               converted to mode spop if such servers are detected.
+
+    udp       (specific to this build) The instance forwards UDP datagrams.
+              "bind" lines become plain UDP receivers (IPv4/IPv6 only, no
+              QUIC nor UNIX sockets). Each client address/port is a "UDP
+              session" which gets its own connected socket to the selected
+              server, and server replies are sent back to the client from the
+              address it contacted (IP_PKTINFO is used on wildcard binds).
+              A session ends after "timeout udp" of inactivity, or when its
+              server goes down, changes address or reports an error (e.g. an
+              ICMP port unreachable). It is recommended to place "mode udp"
+              before the "bind" lines; the mode cannot be changed from udp to
+              another one after "bind" lines were declared.
+
+              Supported features:
+                - "balance" algorithms which do not depend on HTTP: roundrobin,
+                  static-rr, leastconn, first, source, random, hash <expr> and
+                  rdp-cookie, evaluated on the first datagram of a session ;
+                - "use_backend" (including dynamic names made of text and
+                  %[...] expressions) and "default_backend", toward "mode udp"
+                  backends ;
+                - "udp-request" (or "tcp-request") connection, session and
+                  content rules with the "accept", "reject", "set-var",
+                  "unset-var" and "do-resolve" actions, evaluated once per new
+                  session; content rules can inspect the first datagram with
+                  the "req.payload" family of fetches ;
+                - "maxconn" on bind lines, frontends, servers and globally,
+                  counting UDP sessions ;
+                - servers without port or with a +/- port offset, "0.0.0.0"
+                  servers (forward to the address the client contacted),
+                  "source" (address only), "check" (see below), "observe
+                  layer4", "agent-check", DNS resolution with "resolvers".
+
+              Health checks send an empty datagram at each interval and
+              report a failure when the previous probe triggered an ICMP
+              error (closed port, unreachable host).
+
+              When "log" is configured, one line is emitted at the end of each
+              UDP session with the following format (not configurable):
+                <cli_ip>:<cli_port> [udp] <frontend> <backend>/<server>
+                <srv_ip>:<srv_port> <duration>ms req=<pkts>/<bytes>
+                res=<pkts>/<bytes> <reason>
+              where <reason> is one of "idle-timeout" (logged at "info" level,
+              skipped with "option dontlog-normal"), "server-error",
+              "send-error", "server-down" or "server-moved" (logged at "notice"
+              level).
+
+              When a "do-resolve" rule needs a name which was never resolved
+              yet, the datagram triggering the resolution is dropped; the next
+              ones use the result, which is then refreshed in the background.
 
 
   When doing content switching, it is mandatory that the frontend and the
@@ -15180,6 +15231,43 @@ timeout tunnel <timeout>
   See also : "timeout client", "timeout client-fin", "timeout server".
 
 
+timeout udp <timeout>
+  Set the maximum inactivity time of a UDP session in "mode udp".
+
+  May be used in the following contexts: udp
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    yes   |   yes  |   no
+
+  Arguments :
+    <timeout> is the timeout value specified in milliseconds by default, but
+              can be in any other unit if the number is suffixed by the unit,
+              as explained at the top of this document.
+
+  UDP has no notion of connection close, so a UDP session (one client address
+  and port) is only released once no datagram was exchanged in either
+  direction for this duration. It is independent from "timeout client" and
+  "timeout server", which are usually set to long values for TCP and must not
+  apply to UDP sessions, otherwise sockets would accumulate. The default value
+  is 60 seconds. Short values suit request/response protocols where each
+  request uses a new source port (e.g. DNS), longer ones protocols relying on
+  periodic keep-alives (e.g. VPNs, games).
+
+  Example :
+        defaults
+            timeout client 7d
+            timeout server 7d
+            timeout udp 1m
+
+        listen dns
+            mode udp
+            timeout udp 10s
+            bind :53
+            server dns1 192.0.2.53:53
+
+  See also : "mode".
+
+
 transparent (deprecated)
   Enable client-side transparent proxying
 
@@ -15205,6 +15293,35 @@ transparent (deprecated)
   present the client's IP to the server when establishing the connection.
 
   See also: "option transparent"
+
+udp-request <rule-type> <action> [{if | unless} <condition>]
+  Same as "tcp-request", meant for "mode udp" proxies.
+
+  May be used in the following contexts: udp
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 no    |    yes   |   yes  |   no
+
+  "udp-request connection", "udp-request session" and "udp-request content"
+  rules are evaluated once, on the first datagram of each new UDP session, in
+  this order. Only the "accept", "reject", "set-var", "unset-var" and
+  "do-resolve" actions are supported, other ones are reported at startup and
+  ignored. A rejected datagram does not create a session, so the rules are
+  evaluated again for the next datagram of the same client. Content rules see
+  the first datagram as the request buffer ("req.payload", "req.len", ...),
+  and "dst"/"dst_port" report the address the client contacted.
+
+  Using "udp-request" in another mode is accepted but reported, since it then
+  behaves exactly like "tcp-request".
+
+  Example :
+        listen wg
+            mode udp
+            bind :51820
+            udp-request content reject if !{ src 192.0.2.0/24 }
+            server wg1 vpn.example.com:51820 check
+
+  See also : "mode", "tcp-request connection", "tcp-request content".
 
 unique-id-format <fmt>
   Generate a unique ID for each request.

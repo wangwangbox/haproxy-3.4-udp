@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright (C) 2013-2015 Willy Tarreau <w@1wt.eu>
  *
  * Permission is hereby granted, free of charge, to any person obtaining

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/htx-t.h
  * This file declares the types and constants used the internal HTTP messages
  *

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * FastCGI mux-demux for connections
  *
  * Copyright (C) 2019 HAProxy Technologies, Christopher Faulet <cfaulet@haproxy.com>

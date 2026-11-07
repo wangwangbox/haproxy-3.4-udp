@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/chunk.h
  * Chunk management definitions, macros and inline functions.
  *

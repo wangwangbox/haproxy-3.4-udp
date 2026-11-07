@@ -1,4 +1,4 @@
-﻿
+
 /*
  * SSL/TLS transport layer over SOCK_STREAM sockets
  *

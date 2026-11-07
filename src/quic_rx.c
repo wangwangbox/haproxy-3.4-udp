@@ -1,4 +1,4 @@
-﻿/*
+/*
  * QUIC protocol implementation. Lower layer with internal features implemented
  * here such as QUIC encryption, idle timeout, acknowledgement and
  * retransmission.

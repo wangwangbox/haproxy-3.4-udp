@@ -1,4 +1,4 @@
-﻿/*
+/*
  * HTTP/1 mux-demux for connections
  *
  * Copyright 2018 Christopher Faulet <cfaulet@haproxy.com>

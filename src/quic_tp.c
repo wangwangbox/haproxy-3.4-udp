@@ -1,4 +1,4 @@
-﻿#include <arpa/inet.h>
+#include <arpa/inet.h>
 #include <string.h>
 
 #include <haproxy/connection.h>

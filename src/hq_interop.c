@@ -1,4 +1,4 @@
-﻿#include <haproxy/hq_interop.h>
+#include <haproxy/hq_interop.h>
 
 #include <import/ist.h>
 #include <haproxy/buf.h>

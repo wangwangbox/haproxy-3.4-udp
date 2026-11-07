@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Name server resolution
  *
  * Copyright 2014 Baptiste Assmann <bedis9@gmail.com>

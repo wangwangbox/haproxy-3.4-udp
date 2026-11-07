@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/stream.h
  * This file defines everything related to streams.
  *

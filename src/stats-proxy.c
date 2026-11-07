@@ -1,4 +1,4 @@
-﻿#include <haproxy/stats-proxy.h>
+#include <haproxy/stats-proxy.h>
 
 #include <errno.h>
 #include <string.h>

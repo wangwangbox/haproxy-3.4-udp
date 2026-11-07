@@ -1,4 +1,4 @@
-﻿/*
+/*
  * HTTP/1 protocol analyzer
  *
  * Copyright 2000-2017 Willy Tarreau <w@1wt.eu>

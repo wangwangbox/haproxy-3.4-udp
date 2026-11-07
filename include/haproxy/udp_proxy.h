@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/udp_proxy.h
  * Datagram proxying.
  */

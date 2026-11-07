@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/compiler.h
  * This files contains some compiler-specific settings.
  *

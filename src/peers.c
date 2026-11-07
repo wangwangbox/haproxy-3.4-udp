@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Peer synchro management.
  *
  * Copyright 2010 EXCELIANCE, Emeric Brun <ebrun@exceliance.fr>

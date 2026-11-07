@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/htx.h
  * This file defines everything related to the internal HTTP messages.
  *

@@ -1,4 +1,4 @@
-﻿#include <haproxy/qcm_http.h>
+#include <haproxy/qcm_http.h>
 
 #include <haproxy/api-t.h>
 #include <haproxy/htx.h>

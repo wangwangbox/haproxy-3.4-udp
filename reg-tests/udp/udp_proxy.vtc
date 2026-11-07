@@ -1,0 +1,143 @@
+varnishtest "mode udp forwarding (this build's UDP proxy)"
+
+# HTTP frontends emit their logs over UDP to "mode udp" proxies, which forward
+# them to VTest syslog servers. This checks plain forwarding, "timeout udp",
+# dynamic "use_backend" with "dst_port", "default_backend", and a
+# "udp-request content reject" rule inspecting the first datagram.
+
+feature cmd "$HAPROXY_PROGRAM -cc 'version_atleast(3.4)'"
+feature ignore_unknown_macro
+
+server s1 {
+    rxreq
+    txresp
+} -repeat 8 -start
+
+# plain listen
+syslog Slg1 -level info {
+    recv
+    expect ~ "\"GET /client_c1 HTTP/1.1\""
+} -start
+
+# dynamic use_backend built from dst_port
+syslog Slg2 -level info {
+    recv
+    expect ~ "\"GET /client_c2 HTTP/1.1\""
+} -start
+
+# default_backend when no rule matches
+syslog Slg3 -level info {
+    recv
+    expect ~ "\"GET /client_c3 HTTP/1.1\""
+} -start
+
+# the first datagram is rejected by a content rule, only the second one
+# creates the UDP session and must be the first one received
+syslog Slg4 -level info {
+    recv
+    expect ~ "\"GET /client_ok HTTP/1.1\""
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults http_def
+        mode http
+        option httplog
+        timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    defaults udp_def
+        mode udp
+        timeout udp 5s
+
+    backend be from http_def
+        server app1 ${s1_addr}:${s1_port}
+
+    frontend fe1 from http_def
+        bind "fd@${fe1}"
+        log 127.0.0.1:15141 local0
+        default_backend be
+
+    frontend fe2 from http_def
+        bind "fd@${fe2}"
+        log 127.0.0.1:15142 local0
+        default_backend be
+
+    frontend fe3 from http_def
+        bind "fd@${fe3}"
+        log 127.0.0.1:15143 local0
+        default_backend be
+
+    frontend fe4 from http_def
+        bind "fd@${fe4}"
+        log 127.0.0.1:15144 local0
+        default_backend be
+
+    listen udp1 from udp_def
+        bind 127.0.0.1:15141
+        server slg1 ${Slg1_addr}:${Slg1_port}
+
+    frontend udp2 from udp_def
+        bind 127.0.0.1:15142
+        use_backend udpbe_%[dst_port]
+        default_backend udpbe_unused
+
+    backend udpbe_15142 from udp_def
+        server slg2 ${Slg2_addr}:${Slg2_port}
+
+    backend udpbe_unused from udp_def
+        server none 127.0.0.1:9
+
+    frontend udp3 from udp_def
+        bind 127.0.0.1:15143
+        use_backend udpbe_unused if { src 192.0.2.1 }
+        default_backend udpbe3
+
+    backend udpbe3 from udp_def
+        server slg3 ${Slg3_addr}:${Slg3_port}
+
+    listen udp4 from udp_def
+        bind 127.0.0.1:15144
+        udp-request content reject if { req.payload(0,0) -m sub client_reject }
+        server slg4 ${Slg4_addr}:${Slg4_port}
+} -start
+
+client c1 -connect ${h1_fe1_sock} {
+    txreq -url "/client_c1"
+    rxresp
+    expect resp.status == 200
+} -run
+
+client c2 -connect ${h1_fe2_sock} {
+    txreq -url "/client_c2"
+    rxresp
+    expect resp.status == 200
+} -run
+
+client c3 -connect ${h1_fe3_sock} {
+    txreq -url "/client_c3"
+    rxresp
+    expect resp.status == 200
+} -run
+
+client c4 -connect ${h1_fe4_sock} {
+    txreq -url "/client_reject"
+    rxresp
+    expect resp.status == 200
+} -run
+
+client c5 -connect ${h1_fe4_sock} {
+    txreq -url "/client_ok"
+    rxresp
+    expect resp.status == 200
+} -run
+
+syslog Slg1 -wait
+syslog Slg2 -wait
+syslog Slg3 -wait
+syslog Slg4 -wait

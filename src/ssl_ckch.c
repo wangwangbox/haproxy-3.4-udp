@@ -1,4 +1,4 @@
-﻿/*
+/*
  *
  * Copyright (C) 2020 HAProxy Technologies, William Lallemand <wlallemand@haproxy.com>
  *

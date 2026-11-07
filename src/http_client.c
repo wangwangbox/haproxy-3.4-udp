@@ -1,4 +1,4 @@
-﻿/*
+/*
  * HTTP Client
  *
  * Copyright (C) 2021 HAProxy Technologies, William Lallemand <wlallemand@haproxy.com>

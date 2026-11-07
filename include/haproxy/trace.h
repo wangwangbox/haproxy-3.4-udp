@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/trace.h
  * This file provides functions for runtime tracing
  *

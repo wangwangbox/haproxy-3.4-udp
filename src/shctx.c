@@ -1,4 +1,4 @@
-﻿/*
+/*
  * shctx.c - shared context management functions for SSL
  *
  * Copyright (C) 2011-2012 EXCELIANCE

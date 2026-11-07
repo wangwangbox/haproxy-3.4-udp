@@ -1,4 +1,4 @@
-﻿#include <import/eb64tree.h>
+#include <import/eb64tree.h>
 
 #include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_conn-t.h>

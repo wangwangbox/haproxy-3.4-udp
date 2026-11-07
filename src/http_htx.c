@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Functions to manipulate HTTP messages using the internal representation.
  *
  * Copyright (C) 2018 HAProxy Technologies, Christopher Faulet <cfaulet@haproxy.com>

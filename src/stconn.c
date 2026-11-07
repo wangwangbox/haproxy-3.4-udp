@@ -1,4 +1,4 @@
-﻿/*
+/*
  * stream connector management functions
  *
  * Copyright 2021 Christopher Faulet <cfaulet@haproxy.com>

@@ -1,4 +1,4 @@
-﻿
+
 /*
  * SSL/TLS OCSP-related functions
  *

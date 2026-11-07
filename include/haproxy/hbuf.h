@@ -1,4 +1,4 @@
-﻿#ifndef _HAPROXY_HBUF_H
+#ifndef _HAPROXY_HBUF_H
 #define _HAPROXY_HBUF_H
 
 #include <stdlib.h>

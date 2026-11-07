@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Lua unsafe core engine
  *
  * Copyright 2015-2016 Thierry Fournier <tfournier@arpalert.org>

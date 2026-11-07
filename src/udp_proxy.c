@@ -1,4 +1,4 @@
-﻿/*
+/*
  * UDP proxying for regular listen/frontend sections.
  */
 
@@ -30,13 +30,14 @@
 #include <haproxy/lb_ss.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
+#include <haproxy/log.h>
 #include <haproxy/obj_type.h>
 #include <haproxy/pool.h>
 #include <haproxy/proxy.h>
 #include <haproxy/queue.h>
 #include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
-#include <haproxy/server-t.h>
+#include <haproxy/server.h>
 #include <haproxy/session-t.h>
 #include <haproxy/stream-t.h>
 #include <haproxy/task.h>
@@ -47,7 +48,7 @@
 #include <haproxy/udp_proxy.h>
 #include <haproxy/vars.h>
 
-#define UDP_PROXY_SESS_TIMEOUT_MS 60000
+#define UDP_PROXY_SESS_TIMEOUT_MS 60000  /* default for "timeout udp" */
 #define UDP_PROXY_GC_INTERVAL_MS 1000
 #define UDP_PROXY_HASH_BITS 12
 #define UDP_PROXY_HASH_SIZE (1U << UDP_PROXY_HASH_BITS)
@@ -77,6 +78,23 @@
 #define UDP_RESOLV_VALID   1   /* <ip> holds the last resolved address */
 #define UDP_RESOLV_FAILED  2   /* last resolution failed */
 
+/* reasons for ending a UDP session, reported in the logs */
+enum udp_proxy_end {
+	UDP_END_TIMEOUT = 0,   /* idle timeout: the normal end */
+	UDP_END_SRV_ERR,       /* error reported by the server socket (e.g. ICMP) */
+	UDP_END_SEND_ERR,      /* failed to forward a datagram to the server */
+	UDP_END_SRV_DOWN,      /* server went down or into maintenance */
+	UDP_END_SRV_MOVED,     /* server address or port changed */
+};
+
+static const char *udp_proxy_end_str[] = {
+	[UDP_END_TIMEOUT]   = "idle-timeout",
+	[UDP_END_SRV_ERR]   = "server-error",
+	[UDP_END_SEND_ERR]  = "send-error",
+	[UDP_END_SRV_DOWN]  = "server-down",
+	[UDP_END_SRV_MOVED] = "server-moved",
+};
+
 struct udp_proxy_session {
 	struct list by_hash;
 	struct listener *listener;
@@ -87,6 +105,14 @@ struct udp_proxy_session {
 	unsigned int hash;
 	int fd;
 	int expire;
+	int timeout;                      /* idle timeout in ticks ("timeout udp") */
+	int start;                        /* creation date (now_ms) */
+	/* traffic, the part not yet reported to the stats counters is the
+	 * difference with the *_flushed values.
+	 */
+	unsigned long long req_pkts, req_bytes;  /* client -> server */
+	unsigned long long res_pkts, res_bytes;  /* server -> client */
+	unsigned long long req_flushed, res_flushed;
 };
 
 /* A name resolved by a "do-resolve" rule. The result is kept per thread and
@@ -124,7 +150,7 @@ static int udp_proxy_nb_sessions;
 static int udp_proxy_used;
 static THREAD_LOCAL char *udp_proxy_rxbuf;
 
-static void udp_proxy_delete_session(struct udp_proxy_session *sess);
+static void udp_proxy_delete_session(struct udp_proxy_session *sess, enum udp_proxy_end reason);
 
 static void udp_proxy_shard_init(struct udp_proxy_shard *shard)
 {
@@ -908,6 +934,90 @@ static struct server *udp_proxy_pick_lb_server(struct proxy *px, struct stream *
 	return srv;
 }
 
+/* Builds the backend name of a dynamic "use_backend" rule and looks it up.
+ * Only text and sample expressions (%[...]) are supported, which covers the
+ * usual "use_backend be_%[...]" forms. Returns the backend or NULL.
+ */
+static struct proxy *udp_proxy_dynamic_backend(struct lf_expr *expr, struct proxy *fe,
+                                               struct session *sess, struct stream *strm)
+{
+	struct logformat_node *node;
+	char name[256];
+	size_t len = 0;
+
+	if (!(expr->flags & LF_FL_COMPILED))
+		return NULL;
+
+	list_for_each_entry(node, &expr->nodes.list, list) {
+		struct sample *smp;
+		const char *p;
+		size_t n;
+
+		switch (node->type) {
+		case LOG_FMT_TEXT:
+			p = node->arg;
+			n = p ? strlen(p) : 0;
+			break;
+		case LOG_FMT_SEPARATOR:
+			p = " ";
+			n = 1;
+			break;
+		case LOG_FMT_EXPR:
+			smp = sample_fetch_as_type(fe, sess, strm, SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
+			                           node->expr, SMP_T_STR);
+			if (!smp)
+				return NULL;
+			p = smp->data.u.str.area;
+			n = smp->data.u.str.data;
+			break;
+		default:
+			return NULL;
+		}
+
+		if (len + n >= sizeof(name))
+			return NULL;
+		memcpy(name + len, p, n);
+		len += n;
+	}
+	name[len] = 0;
+
+	return proxy_be_by_name(name);
+}
+
+/* Returns non-zero if the dynamic rule <expr> only uses what
+ * udp_proxy_dynamic_backend() supports. Unknown if not compiled yet.
+ */
+static int udp_proxy_dynamic_supported(struct lf_expr *expr)
+{
+	struct logformat_node *node;
+
+	if (!(expr->flags & LF_FL_COMPILED))
+		return 1;
+
+	list_for_each_entry(node, &expr->nodes.list, list) {
+		if (node->type != LOG_FMT_TEXT && node->type != LOG_FMT_SEPARATOR &&
+		    node->type != LOG_FMT_EXPR)
+			return 0;
+	}
+	return 1;
+}
+
+static void udp_proxy_count_denied(struct listener *l, struct proxy *fe, int conn_level)
+{
+	if (fe->fe_counters.shared.tg) {
+		if (conn_level)
+			_HA_ATOMIC_INC(&fe->fe_counters.shared.tg[tgid - 1]->denied_conn);
+		else
+			_HA_ATOMIC_INC(&fe->fe_counters.shared.tg[tgid - 1]->denied_req);
+	}
+	if (l->counters && l->counters->shared.tg && l->counters->shared.tg[tgid - 1]) {
+		if (conn_level)
+			_HA_ATOMIC_INC(&l->counters->shared.tg[tgid - 1]->denied_conn);
+		else
+			_HA_ATOMIC_INC(&l->counters->shared.tg[tgid - 1]->denied_req);
+	}
+}
+
 /* Runs the frontend's rules for a new flow, selects the backend and picks a
  * server. <local> is the address the client contacted (AF_UNSPEC if unknown)
  * and <payload> the first datagram, made available to the rules and to the
@@ -952,20 +1062,34 @@ static struct server *udp_proxy_select_server(struct listener *l,
 	ret = udp_proxy_exec_rules(&fe->tcp_req.l4_rules, fe, &sess, NULL);
 	if (ret == UDP_RULES_ACCEPT)
 		ret = udp_proxy_exec_rules(&fe->tcp_req.l5_rules, fe, &sess, NULL);
+	if (ret == UDP_RULES_REJECT) {
+		udp_proxy_count_denied(l, fe, 1);
+		goto out;
+	}
 	if (ret == UDP_RULES_ACCEPT)
 		ret = udp_proxy_exec_rules(&fe->tcp_req.inspect_rules, fe, &sess, &strm);
+	if (ret == UDP_RULES_REJECT)
+		udp_proxy_count_denied(l, fe, 0);
 	if (ret != UDP_RULES_ACCEPT)
 		goto out;
 
+	/* same semantics as process_switching_rules() */
 	list_for_each_entry(rule, &fe->switching_rules, list) {
-		if (rule->dynamic)
-			continue; /* not supported, reported at boot */
 		if (!acl_match_cond(rule->cond, fe, &sess, &strm, SMP_OPT_DIR_REQ | SMP_OPT_FINAL))
 			continue;
-		if (rule->be.backend && be_is_eligible(rule->be.backend)) {
+
+		if (rule->dynamic)
+			backend = udp_proxy_dynamic_backend(&rule->be.expr, fe, &sess, &strm);
+		else
 			backend = rule->be.backend;
-			break;
+
+		/* ineligible backend: continue rules processing */
+		if (backend && !be_is_eligible(backend)) {
+			backend = NULL;
+			continue;
 		}
+		/* first match, or failed dynamic lookup: default backend */
+		break;
 	}
 
 	/* same fallback as TCP: default_backend, then the frontend itself */
@@ -1027,6 +1151,78 @@ static void udp_proxy_take_server(struct udp_proxy_session *sess)
 		_HA_ATOMIC_INC(&srv->proxy->be_counters.shared.tg[tgid - 1]->cum_lbconn);
 	if (srv->counters.shared.tg)
 		_HA_ATOMIC_INC(&srv->counters.shared.tg[tgid - 1]->cum_lbconn);
+
+	/* cumulated connections/sessions and rates for the stats */
+	proxy_inc_fe_conn_ctr(sess->listener, fe);
+	proxy_inc_fe_sess_ctr(sess->listener, fe);
+	proxy_inc_be_ctr(srv->proxy);
+	srv_inc_sess_ctr(srv);
+}
+
+/* Reports to the stats counters the traffic of <sess> not reported yet. Done
+ * in batches (at least once per second by the GC, and at the end) to avoid
+ * several shared atomic operations per datagram.
+ */
+static void udp_proxy_flush_stats(struct udp_proxy_session *sess)
+{
+	long long req = sess->req_bytes - sess->req_flushed;
+	long long res = sess->res_bytes - sess->res_flushed;
+	struct listener *l = sess->listener;
+	struct proxy *fe = l->bind_conf->frontend;
+	struct server *srv = sess->srv;
+	struct proxy *be = srv->proxy;
+
+	if (!req && !res)
+		return;
+
+	sess->req_flushed = sess->req_bytes;
+	sess->res_flushed = sess->res_bytes;
+
+	if (fe->fe_counters.shared.tg) {
+		_HA_ATOMIC_ADD(&fe->fe_counters.shared.tg[tgid - 1]->req_in, req);
+		_HA_ATOMIC_ADD(&fe->fe_counters.shared.tg[tgid - 1]->res_out, res);
+	}
+	if (l->counters && l->counters->shared.tg && l->counters->shared.tg[tgid - 1]) {
+		_HA_ATOMIC_ADD(&l->counters->shared.tg[tgid - 1]->req_in, req);
+		_HA_ATOMIC_ADD(&l->counters->shared.tg[tgid - 1]->res_out, res);
+	}
+	if (be->be_counters.shared.tg) {
+		_HA_ATOMIC_ADD(&be->be_counters.shared.tg[tgid - 1]->req_out, req);
+		_HA_ATOMIC_ADD(&be->be_counters.shared.tg[tgid - 1]->res_in, res);
+	}
+	if (srv->counters.shared.tg) {
+		_HA_ATOMIC_ADD(&srv->counters.shared.tg[tgid - 1]->req_out, req);
+		_HA_ATOMIC_ADD(&srv->counters.shared.tg[tgid - 1]->res_in, res);
+	}
+}
+
+/* Logs the end of <sess> on the frontend's loggers, if any. "option
+ * dontlog-normal" skips sessions which simply expired.
+ */
+static void udp_proxy_log_session(struct udp_proxy_session *sess, enum udp_proxy_end reason)
+{
+	struct proxy *fe = sess->listener->bind_conf->frontend;
+	char cli[INET6_ADDRSTRLEN] = "-";
+	char srv[INET6_ADDRSTRLEN] = "-";
+
+	if (LIST_ISEMPTY(&fe->loggers))
+		return;
+	if (reason == UDP_END_TIMEOUT && (fe->options2 & PR_O2_NOLOGNORM))
+		return;
+
+	if (addr_to_str(&sess->client, cli, sizeof(cli)) <= 0)
+		strcpy(cli, "-");
+	if (addr_to_str(&sess->srv_addr, srv, sizeof(srv)) <= 0)
+		strcpy(srv, "-");
+
+	send_log(fe, reason == UDP_END_TIMEOUT ? LOG_INFO : LOG_NOTICE,
+	         "%s:%d [udp] %s %s/%s %s:%d %ums req=%llu/%llu res=%llu/%llu %s\n",
+	         cli, get_host_port(&sess->client), fe->id,
+	         sess->srv->proxy->id, sess->srv->id,
+	         srv, get_host_port(&sess->srv_addr),
+	         (unsigned int)(now_ms - sess->start),
+	         sess->req_pkts, sess->req_bytes, sess->res_pkts, sess->res_bytes,
+	         udp_proxy_end_str[reason]);
 }
 
 static void udp_proxy_drop_server(struct udp_proxy_session *sess)
@@ -1053,7 +1249,7 @@ static void udp_proxy_prune_bucket(struct udp_proxy_shard *shard, unsigned int b
 
 	list_for_each_entry_safe(sess, back, &shard->buckets[bucket], by_hash) {
 		if (tick_is_expired(sess->expire, now_ms))
-			udp_proxy_delete_session(sess);
+			udp_proxy_delete_session(sess, UDP_END_TIMEOUT);
 	}
 }
 
@@ -1071,8 +1267,17 @@ static void udp_proxy_gc_all(struct udp_proxy_shard *shard)
 {
 	unsigned int i;
 
-	for (i = 0; i < UDP_PROXY_HASH_SIZE; i++)
-		udp_proxy_prune_bucket(shard, i);
+	for (i = 0; i < UDP_PROXY_HASH_SIZE; i++) {
+		struct udp_proxy_session *sess, *back;
+
+		/* once per second: expire idle sessions and report traffic */
+		list_for_each_entry_safe(sess, back, &shard->buckets[i], by_hash) {
+			if (tick_is_expired(sess->expire, now_ms))
+				udp_proxy_delete_session(sess, UDP_END_TIMEOUT);
+			else
+				udp_proxy_flush_stats(sess);
+		}
+	}
 }
 
 static struct task *udp_proxy_gc_task(struct task *t, void *context, unsigned int state)
@@ -1152,12 +1357,19 @@ static void udp_proxy_session_fd_handler(int fd)
 
 			/* Connected UDP sockets report asynchronous ICMP errors here. */
 			health_adjust(sess->srv, HANA_STATUS_L4_ERR);
-			udp_proxy_delete_session(sess);
+			udp_proxy_delete_session(sess, UDP_END_SRV_ERR);
 			return;
 		}
 
-		health_adjust(sess->srv, HANA_STATUS_L4_OK);
-		sess->expire = tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_SESS_TIMEOUT_MS));
+		/* only needed to clear a previous error streak ("observe layer4"):
+		 * avoids an atomic write per datagram.
+		 */
+		if (unlikely(_HA_ATOMIC_LOAD(&sess->srv->consecutive_errors)))
+			health_adjust(sess->srv, HANA_STATUS_L4_OK);
+
+		sess->res_pkts++;
+		sess->res_bytes += ret;
+		sess->expire = tick_add(now_ms, sess->timeout);
 		udp_proxy_send_reply(sess->listener->rx.fd, buf, ret, &sess->client, &sess->local);
 	} while (--max_recv);
 }
@@ -1217,15 +1429,18 @@ static int udp_proxy_connect_session(struct udp_proxy_session *sess)
 	return 1;
 }
 
-static void udp_proxy_delete_session(struct udp_proxy_session *sess)
+static void udp_proxy_delete_session(struct udp_proxy_session *sess, enum udp_proxy_end reason)
 {
 	LIST_DEL_INIT(&sess->by_hash);
 	if (sess->fd >= 0) {
 		fd_delete(sess->fd);
 		sess->fd = -1;
 	}
-	if (sess->srv)
+	if (sess->srv) {
+		udp_proxy_flush_stats(sess);
+		udp_proxy_log_session(sess, reason);
 		udp_proxy_drop_server(sess);
+	}
 	free(sess);
 }
 
@@ -1245,8 +1460,12 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 	hash = udp_proxy_hash_key(l, client, local);
 	udp_proxy_prune_bucket(shard, hash & UDP_PROXY_HASH_MASK);
 	sess = udp_proxy_find_client(shard, l, client, local, hash);
-	if (sess && (!udp_proxy_srv_usable(sess->srv) || udp_proxy_srv_moved(sess))) {
-		udp_proxy_delete_session(sess);
+	if (sess && !udp_proxy_srv_usable(sess->srv)) {
+		udp_proxy_delete_session(sess, UDP_END_SRV_DOWN);
+		sess = NULL;
+	}
+	else if (sess && udp_proxy_srv_moved(sess)) {
+		udp_proxy_delete_session(sess, UDP_END_SRV_MOVED);
 		sess = NULL;
 	}
 
@@ -1269,6 +1488,10 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 		sess->hash = hash;
 		sess->fd = -1;
 		sess->srv = srv;
+		sess->start = now_ms;
+		sess->timeout = tick_isset(l->bind_conf->frontend->timeout.udp) ?
+		                l->bind_conf->frontend->timeout.udp :
+		                MS_TO_TICKS(UDP_PROXY_SESS_TIMEOUT_MS);
 		if (!udp_proxy_connect_session(sess)) {
 			free(sess);
 			return NULL;
@@ -1278,7 +1501,7 @@ static struct udp_proxy_session *udp_proxy_get_session(struct listener *l,
 		LIST_APPEND(&shard->buckets[hash & UDP_PROXY_HASH_MASK], &sess->by_hash);
 	}
 
-	sess->expire = tick_add(now_ms, MS_TO_TICKS(UDP_PROXY_SESS_TIMEOUT_MS));
+	sess->expire = tick_add(now_ms, sess->timeout);
 	return sess;
 }
 
@@ -1291,14 +1514,17 @@ static int udp_proxy_send_connected(struct udp_proxy_session *sess,
 		ret = send(sess->fd, buf, len, 0);
 	} while (ret < 0 && errno == EINTR);
 
-	if (ret == (ssize_t)len)
+	if (ret == (ssize_t)len) {
+		sess->req_pkts++;
+		sess->req_bytes += len;
 		return 1;
+	}
 
 	if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
 		return 0;
 
 	health_adjust(sess->srv, HANA_STATUS_L4_ERR);
-	udp_proxy_delete_session(sess);
+	udp_proxy_delete_session(sess, UDP_END_SEND_ERR);
 	return -1;
 }
 
@@ -1370,8 +1596,8 @@ int udp_proxy_check_proxy(struct proxy *px)
 	udp_proxy_warn_rules(px, &px->tcp_req.inspect_rules, "content");
 
 	list_for_each_entry(swrule, &px->switching_rules, list) {
-		if (swrule->dynamic)
-			ha_warning("parsing [%s:%d] : proxy '%s' : dynamic 'use_backend' rules are not supported in 'mode udp' and are ignored.\n",
+		if (swrule->dynamic && !udp_proxy_dynamic_supported(&swrule->be.expr))
+			ha_warning("parsing [%s:%d] : proxy '%s' : in 'mode udp', dynamic 'use_backend' names may only contain text and %%[...] expressions; this rule will fall back to the default backend.\n",
 			           swrule->file ? swrule->file : "?", swrule->line, px->id);
 	}
 

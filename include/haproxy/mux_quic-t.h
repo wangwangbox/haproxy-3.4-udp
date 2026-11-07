@@ -1,4 +1,4 @@
-﻿#ifndef _HAPROXY_MUX_QUIC_T_H
+#ifndef _HAPROXY_MUX_QUIC_T_H
 #define _HAPROXY_MUX_QUIC_T_H
 
 #ifdef USE_QUIC

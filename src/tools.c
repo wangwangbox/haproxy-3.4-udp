@@ -1,4 +1,4 @@
-﻿/*
+/*
  * General purpose functions.
  *
  * Copyright 2000-2010 Willy Tarreau <w@1wt.eu>

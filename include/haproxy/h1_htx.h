@@ -1,4 +1,4 @@
-﻿/*
+/*
  * include/haproxy/h1_htx.h
  * This file defines function prototypes for H1 manipulation using the
  * internal representation.

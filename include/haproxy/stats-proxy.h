@@ -1,4 +1,4 @@
-﻿#ifndef _HAPROXY_STATS_PROXY_H
+#ifndef _HAPROXY_STATS_PROXY_H
 #define _HAPROXY_STATS_PROXY_H
 
 #include <haproxy/api-t.h>

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This program is free software; you can redistribute it and/or
